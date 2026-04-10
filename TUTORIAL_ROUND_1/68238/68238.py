@@ -1,76 +1,10 @@
-from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
+from datamodel import OrderDepth, TradingState, Order
 import json
-from typing import Any
-
-####### LOGGER #######
-
-class Logger:
-    def __init__(self) -> None:
-        self.logs = ""
-        self.max_log_length = 3750
-
-    def print(self, *objects: Any, sep: str = " ", end: str = "\n") -> None:
-        self.logs += sep.join(map(str, objects)) + end
-
-    def flush(self, state: TradingState, orders: dict[Symbol, list[Order]], conversions: int, trader_data: str) -> None:
-        base_length = len(self.to_json([self.compress_state(state, ""), self.compress_orders(orders), conversions, "", ""]))
-        max_item_length = (self.max_log_length - base_length) // 3
-        print(self.to_json([
-            self.compress_state(state, self.truncate(state.traderData, max_item_length)),
-            self.compress_orders(orders),
-            conversions,
-            self.truncate(trader_data, max_item_length),
-            self.truncate(self.logs, max_item_length),
-        ]))
-        self.logs = ""
-
-    def compress_state(self, state: TradingState, trader_data: str) -> list[Any]:
-        return [state.timestamp, trader_data, self.compress_listings(state.listings),
-                self.compress_order_depths(state.order_depths), self.compress_trades(state.own_trades),
-                self.compress_trades(state.market_trades), state.position, self.compress_observations(state.observations)]
-
-    def compress_listings(self, listings: dict[Symbol, Listing]) -> list[list[Any]]:
-        return [[l.symbol, l.product, l.denomination] for l in listings.values()]
-
-    def compress_order_depths(self, order_depths: dict[Symbol, OrderDepth]) -> dict[Symbol, list[Any]]:
-        return {s: [od.buy_orders, od.sell_orders] for s, od in order_depths.items()}
-
-    def compress_trades(self, trades: dict[Symbol, list[Trade]]) -> list[list[Any]]:
-        return [[t.symbol, t.price, t.quantity, t.buyer, t.seller, t.timestamp]
-                for arr in trades.values() for t in arr]
-
-    def compress_observations(self, observations: Observation) -> list[Any]:
-        conv = {p: [o.bidPrice, o.askPrice, o.transportFees, o.exportTariff, o.importTariff, o.sugarPrice, o.sunlightIndex]
-                for p, o in observations.conversionObservations.items()}
-        return [observations.plainValueObservations, conv]
-
-    def compress_orders(self, orders: dict[Symbol, list[Order]]) -> list[list[Any]]:
-        return [[o.symbol, o.price, o.quantity] for arr in orders.values() for o in arr]
-
-    def to_json(self, value: Any) -> str:
-        return json.dumps(value, cls=ProsperityEncoder, separators=(",", ":"))
-
-    def truncate(self, value: str, max_length: int) -> str:
-        lo, hi = 0, min(len(value), max_length)
-        out = ""
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            candidate = value[:mid]
-            if len(candidate) < len(value):
-                candidate += "..."
-            if len(json.dumps(candidate)) <= max_length:
-                out = candidate
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        return out
-
-logger = Logger()
 
 ####### SYMBOLS #######
 
-STATIC_SYMBOL  = 'EMERALDS'
-DYNAMIC_SYMBOL = 'TOMATOES'
+STATIC_SYMBOL  = 'EMERALDS'   # stable fair value — market make around wall mid
+DYNAMIC_SYMBOL = 'TOMATOES'   # mean-reverting / trending — passive market make for now
 
 POS_LIMITS = {
     STATIC_SYMBOL:  20,
@@ -79,15 +13,17 @@ POS_LIMITS = {
 
 ####### CONFIG #######
 
-STATIC_EDGE = 1
+STATIC_EDGE = 1   # min ticks of edge required to take on EMERALDS
 
 
 class ProductTrader:
+    """Base class with order-book utilities and order helpers."""
 
-    def __init__(self, name, state, new_trader_data, product_group=None):
+    def __init__(self, name, state, prints, new_trader_data, product_group=None):
         self.orders = []
         self.name   = name
         self.state  = state
+        self.prints = prints
         self.new_trader_data = new_trader_data
         self.product_group   = name if product_group is None else product_group
 
@@ -107,12 +43,14 @@ class ProductTrader:
         self.total_mkt_buy_volume  = sum(self.mkt_buy_orders.values())
         self.total_mkt_sell_volume = sum(self.mkt_sell_orders.values())
 
+    # ── internals ──────────────────────────────────────────────────────────────
+
     def _load_traderData(self):
         try:
             if self.state.traderData:
                 return json.loads(self.state.traderData)
         except:
-            pass
+            self.log('ERROR', 'traderData parse failed')
         return {}
 
     def _parse_order_depth(self):
@@ -143,30 +81,44 @@ class ProductTrader:
         except: pass
         return best_bid, best_ask
 
+    # ── order helpers ──────────────────────────────────────────────────────────
+
     def bid(self, price, volume):
         vol = min(abs(int(volume)), self.max_allowed_buy_volume)
         if vol <= 0: return
         self.orders.append(Order(self.name, int(price), vol))
+        self.log('BUY',  {'p': int(price), 'v': vol}, product_group='ORDERS')
         self.max_allowed_buy_volume -= vol
 
     def ask(self, price, volume):
         vol = min(abs(int(volume)), self.max_allowed_sell_volume)
         if vol <= 0: return
         self.orders.append(Order(self.name, int(price), -vol))
+        self.log('SELL', {'p': int(price), 'v': vol}, product_group='ORDERS')
         self.max_allowed_sell_volume -= vol
+
+    # ── logging ────────────────────────────────────────────────────────────────
+
+    def log(self, kind, message, product_group=None):
+        pg = product_group or self.product_group
+        if pg == 'ORDERS':
+            self.prints.setdefault(pg, []).append({kind: message})
+        else:
+            self.prints.setdefault(pg, {})[kind] = message
 
     def get_orders(self):
         return {}
 
 
 class StaticTrader(ProductTrader):
-    def __init__(self, state, new_trader_data):
-        super().__init__(STATIC_SYMBOL, state, new_trader_data)
+    def __init__(self, state, prints, new_trader_data):
+        super().__init__(STATIC_SYMBOL, state, prints, new_trader_data)
 
     def get_orders(self):
         if self.wall_mid is None:
             return {self.name: self.orders}
 
+        # 1. Take mispriced orders
         for sp, sv in self.mkt_sell_orders.items():
             if sp <= self.wall_mid - STATIC_EDGE:
                 self.bid(sp, sv)
@@ -179,6 +131,7 @@ class StaticTrader(ProductTrader):
             elif bp >= self.wall_mid and self.initial_position > 0:
                 self.ask(bp, min(bv, self.initial_position))
 
+        # 2. Market make: overbid best bid below mid, underbid best ask above mid
         bid_price = int(self.bid_wall + 1)
         ask_price = int(self.ask_wall - 1)
 
@@ -207,13 +160,14 @@ class StaticTrader(ProductTrader):
 
 
 class DynamicTrader(ProductTrader):
-    def __init__(self, state, new_trader_data):
-        super().__init__(DYNAMIC_SYMBOL, state, new_trader_data)
+    def __init__(self, state, prints, new_trader_data):
+        super().__init__(DYNAMIC_SYMBOL, state, prints, new_trader_data)
 
     def get_orders(self):
         if self.wall_mid is None:
             return {self.name: self.orders}
 
+        # 1. Take mispriced orders
         for sp, sv in self.mkt_sell_orders.items():
             if sp <= self.wall_mid - STATIC_EDGE:
                 self.bid(sp, sv)
@@ -226,6 +180,7 @@ class DynamicTrader(ProductTrader):
             elif bp >= self.wall_mid and self.initial_position > 0:
                 self.ask(bp, min(bv, self.initial_position))
 
+        # 2. Market make: overbid best bid below mid, underbid best ask above mid
         bid_price = int(self.bid_wall + 1)
         ask_price = int(self.ask_wall - 1)
 
@@ -253,12 +208,18 @@ class DynamicTrader(ProductTrader):
         return {self.name: self.orders}
 
 
-####### MAIN #######
+# ── Main entry point ───────────────────────────────────────────────────────────
 
 class Trader:
 
     def run(self, state: TradingState):
         new_trader_data = {}
+        prints = {
+            'GENERAL': {
+                'TIMESTAMP': state.timestamp,
+                'POSITIONS': state.position,
+            }
+        }
 
         product_traders = {
             STATIC_SYMBOL:  StaticTrader,
@@ -270,15 +231,19 @@ class Trader:
         for symbol, TraderClass in product_traders.items():
             if symbol in state.order_depths:
                 try:
-                    trader = TraderClass(state, new_trader_data)
+                    trader = TraderClass(state, prints, new_trader_data)
                     result.update(trader.get_orders())
                 except Exception as e:
-                    logger.print(f"ERROR {symbol}: {e}")
+                    prints.setdefault('ERRORS', {})[symbol] = str(e)
 
         try:
             final_trader_data = json.dumps(new_trader_data)
         except:
             final_trader_data = ''
 
-        logger.flush(state, result, conversions, final_trader_data)
+        try:
+            print(json.dumps(prints))
+        except:
+            pass
+
         return result, conversions, final_trader_data
