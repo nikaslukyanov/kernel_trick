@@ -110,8 +110,6 @@ class ProductTrader:
         return {}
 
 
-# ── EMERALDS — stable fair value, market make around wall mid ─────────────────
-
 class StaticTrader(ProductTrader):
     def __init__(self, state, prints, new_trader_data):
         super().__init__(STATIC_SYMBOL, state, prints, new_trader_data)
@@ -161,9 +159,6 @@ class StaticTrader(ProductTrader):
         return {self.name: self.orders}
 
 
-# ── TOMATOES — passive market make until we have informed trader IDs ──────────
-# TODO: add informed trader logic once IDs are known from round data
-
 class DynamicTrader(ProductTrader):
     def __init__(self, state, prints, new_trader_data):
         super().__init__(DYNAMIC_SYMBOL, state, prints, new_trader_data)
@@ -172,8 +167,43 @@ class DynamicTrader(ProductTrader):
         if self.wall_mid is None:
             return {self.name: self.orders}
 
-        self.bid(self.bid_wall + 1, self.max_allowed_buy_volume)
-        self.ask(self.ask_wall - 1, self.max_allowed_sell_volume)
+        # 1. Take mispriced orders
+        for sp, sv in self.mkt_sell_orders.items():
+            if sp <= self.wall_mid - STATIC_EDGE:
+                self.bid(sp, sv)
+            elif sp <= self.wall_mid and self.initial_position < 0:
+                self.bid(sp, min(sv, abs(self.initial_position)))
+
+        for bp, bv in self.mkt_buy_orders.items():
+            if bp >= self.wall_mid + STATIC_EDGE:
+                self.ask(bp, bv)
+            elif bp >= self.wall_mid and self.initial_position > 0:
+                self.ask(bp, min(bv, self.initial_position))
+
+        # 2. Market make: overbid best bid below mid, underbid best ask above mid
+        bid_price = int(self.bid_wall + 1)
+        ask_price = int(self.ask_wall - 1)
+
+        for bp, bv in self.mkt_buy_orders.items():
+            candidate = bp + 1
+            if bv > 1 and candidate < self.wall_mid:
+                bid_price = max(bid_price, candidate)
+                break
+            elif bp < self.wall_mid:
+                bid_price = max(bid_price, bp)
+                break
+
+        for sp, sv in self.mkt_sell_orders.items():
+            candidate = sp - 1
+            if sv > 1 and candidate > self.wall_mid:
+                ask_price = min(ask_price, candidate)
+                break
+            elif sp > self.wall_mid:
+                ask_price = min(ask_price, sp)
+                break
+
+        self.bid(bid_price, self.max_allowed_buy_volume)
+        self.ask(ask_price, self.max_allowed_sell_volume)
 
         return {self.name: self.orders}
 
