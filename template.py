@@ -4,11 +4,7 @@ import json
 ####### SYMBOLS #######
 
 STATIC_SYMBOL  = 'EMERALDS'   # stable fair value — market make around wall mid
-DYNAMIC_SYMBOL = 'TOMATOES'   # trending / mean-reverting — follow informed trader
-
-LONG, NEUTRAL, SHORT = 1, 0, -1
-
-INFORMED_TRADER_ID = 'Olivia'
+DYNAMIC_SYMBOL = 'TOMATOES'   # mean-reverting / trending — passive market make for now
 
 POS_LIMITS = {
     STATIC_SYMBOL:  20,
@@ -17,12 +13,7 @@ POS_LIMITS = {
 
 ####### CONFIG #######
 
-# StaticTrader
-STATIC_EDGE = 1          # min ticks of edge required to take
-
-# DynamicTrader
-DYNAMIC_INFORMED_WINDOW  = 500   # timestamp window to trust informed signal
-DYNAMIC_INFORMED_MAX_POS = 40    # target position when following informed trader
+STATIC_EDGE = 1   # min ticks of edge required to take on EMERALDS
 
 
 class ProductTrader:
@@ -38,8 +29,8 @@ class ProductTrader:
 
         self.last_traderData = self._load_traderData()
 
-        self.position_limit   = POS_LIMITS.get(self.name, 0)
-        self.initial_position = self.state.position.get(self.name, 0)
+        self.position_limit    = POS_LIMITS.get(self.name, 0)
+        self.initial_position  = self.state.position.get(self.name, 0)
         self.expected_position = self.initial_position
 
         self.mkt_buy_orders, self.mkt_sell_orders = self._parse_order_depth()
@@ -115,32 +106,6 @@ class ProductTrader:
         else:
             self.prints.setdefault(pg, {})[kind] = message
 
-    # ── informed trader detection ──────────────────────────────────────────────
-
-    def check_for_informed(self):
-        informed_bought_ts, informed_sold_ts = self.last_traderData.get(self.name, [None, None])
-
-        trades = (self.state.market_trades.get(self.name, []) +
-                  self.state.own_trades.get(self.name, []))
-
-        for t in trades:
-            if t.buyer  == INFORMED_TRADER_ID: informed_bought_ts = t.timestamp
-            if t.seller == INFORMED_TRADER_ID: informed_sold_ts   = t.timestamp
-
-        self.new_trader_data[self.name] = [informed_bought_ts, informed_sold_ts]
-
-        b, s = informed_bought_ts is not None, informed_sold_ts is not None
-
-        if   not b and not s: direction = NEUTRAL
-        elif not b and     s: direction = SHORT
-        elif     b and not s: direction = LONG
-        elif informed_sold_ts > informed_bought_ts: direction = SHORT
-        elif informed_sold_ts < informed_bought_ts: direction = LONG
-        else: direction = NEUTRAL
-
-        self.log('INFORMED_DIR', direction)
-        return direction, informed_bought_ts, informed_sold_ts
-
     def get_orders(self):
         return {}
 
@@ -196,46 +161,19 @@ class StaticTrader(ProductTrader):
         return {self.name: self.orders}
 
 
-# ── TOMATOES — follow informed trader, passive market make otherwise ───────────
+# ── TOMATOES — passive market make until we have informed trader IDs ──────────
+# TODO: add informed trader logic once IDs are known from round data
 
 class DynamicTrader(ProductTrader):
     def __init__(self, state, prints, new_trader_data):
         super().__init__(DYNAMIC_SYMBOL, state, prints, new_trader_data)
-        self.informed_direction, self.informed_bought_ts, self.informed_sold_ts = \
-            self.check_for_informed()
 
     def get_orders(self):
         if self.wall_mid is None:
             return {self.name: self.orders}
 
-        ts = self.state.timestamp
-
-        # BID leg
-        bid_price  = self.bid_wall + 1
-        bid_volume = self.max_allowed_buy_volume
-
-        if self.informed_bought_ts is not None and self.informed_bought_ts + DYNAMIC_INFORMED_WINDOW >= ts:
-            if self.initial_position < DYNAMIC_INFORMED_MAX_POS:
-                bid_price  = self.ask_wall
-                bid_volume = DYNAMIC_INFORMED_MAX_POS - self.initial_position
-        elif self.wall_mid - bid_price < 1 and self.informed_direction == SHORT and self.initial_position > -DYNAMIC_INFORMED_MAX_POS:
-            bid_price = self.bid_wall
-
-        self.bid(bid_price, bid_volume)
-
-        # ASK leg
-        ask_price  = self.ask_wall - 1
-        ask_volume = self.max_allowed_sell_volume
-
-        if self.informed_sold_ts is not None and self.informed_sold_ts + DYNAMIC_INFORMED_WINDOW >= ts:
-            if self.initial_position > -DYNAMIC_INFORMED_MAX_POS:
-                ask_price  = self.bid_wall
-                ask_volume = DYNAMIC_INFORMED_MAX_POS + self.initial_position
-
-        if ask_price - self.wall_mid < 1 and self.informed_direction == LONG and self.initial_position < DYNAMIC_INFORMED_MAX_POS:
-            ask_price = self.ask_wall
-
-        self.ask(ask_price, ask_volume)
+        self.bid(self.bid_wall + 1, self.max_allowed_buy_volume)
+        self.ask(self.ask_wall - 1, self.max_allowed_sell_volume)
 
         return {self.name: self.orders}
 
