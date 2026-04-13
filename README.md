@@ -1,1 +1,0 @@
-Backtesting instructions: https://github.com/kevin-fu1/imc-prosperity-4-backtester
