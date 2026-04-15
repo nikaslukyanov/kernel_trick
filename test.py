@@ -28,12 +28,78 @@ Run:
     prosperity3bt ../round1/trader.py 0 --data data --print --no-out
 """
 
-from typing import Dict, List, Optional
-from datamodel import OrderDepth, TradingState, Order
+from typing import Any, Dict, List, Optional
+from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
+import json
+
+####### LOGGER #######
+
+class Logger:
+    def __init__(self) -> None:
+        self.logs = ""
+        self.max_log_length = 3750
+
+    def print(self, *objects: Any, sep: str = " ", end: str = "\n") -> None:
+        self.logs += sep.join(map(str, objects)) + end
+
+    def flush(self, state: TradingState, orders: dict[Symbol, list[Order]], conversions: int, trader_data: str) -> None:
+        base_length = len(self.to_json([self.compress_state(state, ""), self.compress_orders(orders), conversions, "", ""]))
+        max_item_length = (self.max_log_length - base_length) // 3
+        print(self.to_json([
+            self.compress_state(state, self.truncate(state.traderData, max_item_length)),
+            self.compress_orders(orders),
+            conversions,
+            self.truncate(trader_data, max_item_length),
+            self.truncate(self.logs, max_item_length),
+        ]))
+        self.logs = ""
+
+    def compress_state(self, state: TradingState, trader_data: str) -> list[Any]:
+        return [state.timestamp, trader_data, self.compress_listings(state.listings),
+                self.compress_order_depths(state.order_depths), self.compress_trades(state.own_trades),
+                self.compress_trades(state.market_trades), state.position, self.compress_observations(state.observations)]
+
+    def compress_listings(self, listings: dict[Symbol, Listing]) -> list[list[Any]]:
+        return [[l.symbol, l.product, l.denomination] for l in listings.values()]
+
+    def compress_order_depths(self, order_depths: dict[Symbol, OrderDepth]) -> dict[Symbol, list[Any]]:
+        return {s: [od.buy_orders, od.sell_orders] for s, od in order_depths.items()}
+
+    def compress_trades(self, trades: dict[Symbol, list[Trade]]) -> list[list[Any]]:
+        return [[t.symbol, t.price, t.quantity, t.buyer, t.seller, t.timestamp]
+                for arr in trades.values() for t in arr]
+
+    def compress_observations(self, observations: Observation) -> list[Any]:
+        conv = {p: [o.bidPrice, o.askPrice, o.transportFees, o.exportTariff, o.importTariff, o.sugarPrice, o.sunlightIndex]
+                for p, o in observations.conversionObservations.items()}
+        return [observations.plainValueObservations, conv]
+
+    def compress_orders(self, orders: dict[Symbol, list[Order]]) -> list[list[Any]]:
+        return [[o.symbol, o.price, o.quantity] for arr in orders.values() for o in arr]
+
+    def to_json(self, value: Any) -> str:
+        return json.dumps(value, cls=ProsperityEncoder, separators=(",", ":"))
+
+    def truncate(self, value: str, max_length: int) -> str:
+        lo, hi = 0, min(len(value), max_length)
+        out = ""
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = value[:mid]
+            if len(candidate) < len(value):
+                candidate += "..."
+            if len(json.dumps(candidate)) <= max_length:
+                out = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return out
+
+logger = Logger()
 
 # ── Strategy switches (change these to experiment) ───────────────────────────
 IPR_STRATEGY = "make_asym"
-ACO_STRATEGY = "naive"
+ACO_STRATEGY = "hybrid"
 
 # ── Shared ───────────────────────────────────────────────────────────────────
 POSITION_LIMIT = 80
@@ -102,7 +168,10 @@ class Trader:
 
             result[product] = orders
 
-        return result, 0, ""
+        conversions = 0
+        trader_data = ""
+        logger.flush(state, result, conversions, trader_data)
+        return result, conversions, trader_data
 
     # ══════════════════════════════════════════════════════════════════════════
     # IPR — INTARIAN_PEPPER_ROOT
