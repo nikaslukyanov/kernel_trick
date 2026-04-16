@@ -98,8 +98,8 @@ class Logger:
 logger = Logger()
 
 # ── Strategy switches (change these to experiment) ───────────────────────────
-IPR_STRATEGY = "make_asym"
-ACO_STRATEGY = "hybrid"
+IPR_STRATEGY = "bh"
+ACO_STRATEGY = "naive"
 
 # ── Shared ───────────────────────────────────────────────────────────────────
 POSITION_LIMIT = 80
