@@ -223,7 +223,7 @@ class StaticTrader(ProductTrader):
 class DynamicTrader(ProductTrader):
     def __init__(self, state):
         super().__init__(DYNAMIC_SYMBOL, state)
-        self.informed_direction, self.informed_bought_ts, self.informed_sold_ts = self.check_for_informed()
+        # self.informed_direction, self.informed_bought_ts, self.informed_sold_ts = self.check_for_informed()
 
     def get_orders(self):
 
@@ -232,29 +232,29 @@ class DynamicTrader(ProductTrader):
             bid_price  = self.bid_wall + 1
             bid_volume = self.max_allowed_buy_volume
 
-            if self.informed_bought_ts is not None and self.informed_bought_ts + 5_00 >= self.state.timestamp:
-                if self.initial_position < 40:
-                    bid_price  = self.ask_wall
-                    bid_volume = 40 - self.initial_position
+            # if self.informed_bought_ts is not None and self.informed_bought_ts + 5_00 >= self.state.timestamp:
+            #     if self.initial_position < 40:
+            #         bid_price  = self.ask_wall
+            #         bid_volume = 40 - self.initial_position
 
-            else:
-                if self.wall_mid - bid_price < 1 and (self.informed_direction == SHORT and self.initial_position > -40):
-                    bid_price = self.bid_wall
+            # else:
+            #     if self.wall_mid - bid_price < 1 and (self.informed_direction == SHORT and self.initial_position > -40):
+            #         bid_price = self.bid_wall
 
             self.bid(bid_price, bid_volume)
 
-            ask_price  = self.ask_wall - 1
-            ask_volume = self.max_allowed_sell_volume
+            # ask_price  = self.ask_wall - 1
+            # ask_volume = self.max_allowed_sell_volume
 
-            if self.informed_sold_ts is not None and self.informed_sold_ts + 5_00 >= self.state.timestamp:
-                if self.initial_position > -40:
-                    ask_price  = self.bid_wall
-                    ask_volume = 40 + self.initial_position
+            # if self.informed_sold_ts is not None and self.informed_sold_ts + 5_00 >= self.state.timestamp:
+            #     if self.initial_position > -40:
+            #         ask_price  = self.bid_wall
+            #         ask_volume = 40 + self.initial_position
 
-            if ask_price - self.wall_mid < 1 and (self.informed_direction == LONG and self.initial_position < 40):
-                ask_price = self.ask_wall
+            # if ask_price - self.wall_mid < 1 and (self.informed_direction == LONG and self.initial_position < 40):
+            #     ask_price = self.ask_wall
 
-            self.ask(ask_price, ask_volume)
+            # self.ask(ask_price, ask_volume)
 
         return {self.name: self.orders}
 
@@ -289,18 +289,36 @@ class Trader:
                     result.update(trader.get_orders())
 
                 elif symbol == DYNAMIC_SYMBOL:
-                    # Buy and hold: accumulate long at any ask below end-of-day fair value
-                    end_of_day_fair_value = self._ipr_fv_eod(order_depth, state.timestamp)
                     orders = []
-                    for ask_price in sorted(order_depth.sell_orders.keys()):
-                        if ask_price >= end_of_day_fair_value:
-                            break
-                        can_buy = POS_LIMIT - position
-                        if can_buy <= 0:
-                            break
-                        quantity = min(-order_depth.sell_orders[ask_price], can_buy)
-                        orders.append(Order(symbol, ask_price, quantity))
-                        position += quantity
+                    
+                    if order_depth.sell_orders:
+                        # Find best ask
+                        best_ask = min(order_depth.sell_orders.keys())
+                        
+                        # Calculate mid price safely
+                        if order_depth.buy_orders:
+                            best_bid = max(order_depth.buy_orders.keys())
+                            mid_price = (best_bid + best_ask) / 2.0
+                        else:
+                            mid_price = best_ask  # Safe fallback if no bids exist
+                        
+                        # Buy up to inventory constraints
+                        for ask_price in sorted(order_depth.sell_orders.keys()):
+                            # Condition: Take only the best ask OR if the ask is within 8 units from mid
+                            if ask_price == best_ask or ask_price <= (mid_price + 8):
+                                can_buy = POS_LIMIT - position
+                                if can_buy <= 0:
+                                    break
+                                
+                                # order_depth.sell_orders volume is negative, so we use min(-volume, limit)
+                                quantity = min(-order_depth.sell_orders[ask_price], can_buy)
+                                orders.append(Order(symbol, ask_price, quantity))
+                                position += quantity
+                            else:
+                                # Since we iterate in sorted order, if this ask is too far, 
+                                # subsequent ones will be even further.
+                                break
+                                
                     result[symbol] = orders
 
             except Exception as e:
