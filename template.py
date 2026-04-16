@@ -73,12 +73,8 @@ POS_LIMIT  = 80
 IPR_SLOPE  = 0.001
 IPR_MAX_TS = 999900
 
-STATIC_SYMBOL  = "ASH_COATED_OSMIUM"
-DYNAMIC_SYMBOL = "INTARIAN_PEPPER_ROOT"
-
-LONG  = 1
-SHORT = -1
-INFORMED_TRADER = ""  # TODO: identify from competition logs
+ASH_SYMBOL  = "ASH_COATED_OSMIUM"
+ROOT_SYMBOL = "INTARIAN_PEPPER_ROOT"
 
 # ASH_COATED_OSMIUM — AR(1) mean-reversion model
 # X_{t+1} = X_t + k*(mu - X_t) + eps,  eps ~ N(0, sigma^2)
@@ -135,29 +131,14 @@ class ProductTrader:
         if logging:
             logger.print(f"ASK {self.name} {int(price)} x{fill_volume}")
 
-    def check_for_informed(self):
-        direction            = None
-        last_bought_timestamp = None
-        last_sold_timestamp   = None
-        if not INFORMED_TRADER:
-            return direction, last_bought_timestamp, last_sold_timestamp
-        for trade in self.state.market_trades.get(self.name, []):
-            if trade.buyer == INFORMED_TRADER:
-                direction             = LONG
-                last_bought_timestamp = trade.timestamp
-            elif trade.seller == INFORMED_TRADER:
-                direction           = SHORT
-                last_sold_timestamp = trade.timestamp
-        return direction, last_bought_timestamp, last_sold_timestamp
-
     def get_orders(self):
         return {self.name: self.orders}
 
 
 # ASH_COATED_OSMIUM
-class StaticTrader(ProductTrader):
+class AshTrader(ProductTrader):
     def __init__(self, state):
-        super().__init__(STATIC_SYMBOL, state)
+        super().__init__(ASH_SYMBOL, state)
 
     def get_orders(self):
 
@@ -166,6 +147,7 @@ class StaticTrader(ProductTrader):
             # AR(1) predicted fair value: shifts the quoting center toward mu
             # when mid > mu we lean to sell; when mid < mu we lean to buy
             fair_value = self.wall_mid + ACO_K * (ACO_MU - self.wall_mid)
+            logger.print(f"ACO_FV:{fair_value:.4f}")
 
             ##########################################################
             ####### 1. TAKING
@@ -220,41 +202,20 @@ class StaticTrader(ProductTrader):
 
 
 # INTARIAN_PEPPER_ROOT
-class DynamicTrader(ProductTrader):
-    def __init__(self, state):
-        super().__init__(DYNAMIC_SYMBOL, state)
-        self.informed_direction, self.informed_bought_ts, self.informed_sold_ts = self.check_for_informed()
+class RootTrader(ProductTrader):
+    def __init__(self, state, end_of_day_fair_value):
+        super().__init__(ROOT_SYMBOL, state)
+        self.end_of_day_fair_value = end_of_day_fair_value
 
     def get_orders(self):
-
-        if self.wall_mid is not None:
-
-            bid_price  = self.bid_wall + 1
-            bid_volume = self.max_allowed_buy_volume
-
-            if self.informed_bought_ts is not None and self.informed_bought_ts + 5_00 >= self.state.timestamp:
-                if self.initial_position < 40:
-                    bid_price  = self.ask_wall
-                    bid_volume = 40 - self.initial_position
-
-            else:
-                if self.wall_mid - bid_price < 1 and (self.informed_direction == SHORT and self.initial_position > -40):
-                    bid_price = self.bid_wall
-
-            self.bid(bid_price, bid_volume)
-
-            ask_price  = self.ask_wall - 1
-            ask_volume = self.max_allowed_sell_volume
-
-            if self.informed_sold_ts is not None and self.informed_sold_ts + 5_00 >= self.state.timestamp:
-                if self.initial_position > -40:
-                    ask_price  = self.bid_wall
-                    ask_volume = 40 + self.initial_position
-
-            if ask_price - self.wall_mid < 1 and (self.informed_direction == LONG and self.initial_position < 40):
-                ask_price = self.ask_wall
-
-            self.ask(ask_price, ask_volume)
+        # Buy and hold: accumulate long at any ask below end-of-day fair value.
+        # end_of_day_fair_value = fv_start + 999900*slope ≈ fv_start + 1000.
+        # Market trades ~1000 below this all day, so the gate always passes —
+        # it is equivalent to always buying but makes the FV comparison explicit.
+        for sell_price, sell_volume in self.mkt_sell_orders.items():
+            if sell_price >= self.end_of_day_fair_value:
+                break
+            self.bid(sell_price, sell_volume)
 
         return {self.name: self.orders}
 
@@ -281,27 +242,14 @@ class Trader:
 
         for symbol in state.order_depths:
             order_depth = state.order_depths[symbol]
-            position    = state.position.get(symbol, 0)
 
             try:
-                if symbol == STATIC_SYMBOL:
-                    trader = StaticTrader(state)
-                    result.update(trader.get_orders())
+                if symbol == ASH_SYMBOL:
+                    result.update(AshTrader(state).get_orders())
 
-                elif symbol == DYNAMIC_SYMBOL:
-                    # Buy and hold: accumulate long at any ask below end-of-day fair value
+                elif symbol == ROOT_SYMBOL:
                     end_of_day_fair_value = self._ipr_fv_eod(order_depth, state.timestamp)
-                    orders = []
-                    for ask_price in sorted(order_depth.sell_orders.keys()):
-                        if ask_price >= end_of_day_fair_value:
-                            break
-                        can_buy = POS_LIMIT - position
-                        if can_buy <= 0:
-                            break
-                        quantity = min(-order_depth.sell_orders[ask_price], can_buy)
-                        orders.append(Order(symbol, ask_price, quantity))
-                        position += quantity
-                    result[symbol] = orders
+                    result.update(RootTrader(state, end_of_day_fair_value).get_orders())
 
             except Exception as e:
                 logger.print(f"ERROR {symbol}: {e}")
