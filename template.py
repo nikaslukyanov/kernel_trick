@@ -182,15 +182,15 @@ class AshTrader(ProductTrader):
         ###########################################################
         ####### 2. MAKING
         ###########################################################
-        best_remaining_bid = next((p for p in self.mkt_buy_orders if p <= fair_value), None)
-        best_remaining_ask = next((p for p in self.mkt_sell_orders if p >= fair_value), None)
-
         # position already reflects taker fills from step 1
         bid_ceiling = int(fair_value) if self.position < 0 else int(fair_value - 1)
         ask_floor   = int(fair_value) if self.position > 0 else int(fair_value + 1)
 
-        bid_price = min((best_remaining_bid + 1) if best_remaining_bid is not None else int(fair_value - 1), bid_ceiling)
-        ask_price = max((best_remaining_ask - 1) if best_remaining_ask is not None else int(fair_value + 1), ask_floor)
+        thick_bid = next((p for p in self.mkt_buy_orders if p <= fair_value and self.mkt_buy_orders[p] > 1), None)
+        thick_ask = next((p for p in self.mkt_sell_orders if p >= fair_value and self.mkt_sell_orders[p] > 1), None)
+
+        bid_price = min((thick_bid + 1) if thick_bid is not None else int(fair_value - 7), bid_ceiling)
+        ask_price = max((thick_ask - 1) if thick_ask is not None else int(fair_value + 7), ask_floor)
 
         maker_buy_volume  = self.max_allowed_buy_volume
         maker_sell_volume = self.max_allowed_sell_volume
