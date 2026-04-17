@@ -89,13 +89,15 @@ class ProductTrader:
 
     def __init__(self, symbol, state):
         self.name  = symbol
-        self.state = state
+        self.state : TradingState = state
         order_depth = state.order_depths.get(symbol, OrderDepth())
         position    = state.position.get(symbol, 0)
 
         self.initial_position = position
         self.position         = position
         self.orders           = []
+        self.buy_volume       = 0
+        self.sell_volume      = 0
 
         self.mkt_buy_orders  = {price: abs(volume) for price, volume in sorted(order_depth.buy_orders.items(),  reverse=True)} if order_depth.buy_orders  else {}
         self.mkt_sell_orders = {price: abs(volume) for price, volume in sorted(order_depth.sell_orders.items())} if order_depth.sell_orders else {}
@@ -105,28 +107,30 @@ class ProductTrader:
 
     @property
     def max_allowed_buy_volume(self):
-        return POS_LIMIT - self.position
+        return POS_LIMIT - self.initial_position - self.buy_volume
 
     @property
     def max_allowed_sell_volume(self):
-        return POS_LIMIT + self.position
+        return POS_LIMIT + self.initial_position - self.sell_volume
 
     def bid(self, price, quantity, logging=False):
-        remaining_capacity = POS_LIMIT - self.position
+        remaining_capacity = POS_LIMIT - self.initial_position - self.buy_volume
         fill_volume = min(quantity, remaining_capacity)
         if fill_volume <= 0:
             return
         self.orders.append(Order(self.name, int(price), fill_volume))
+        self.buy_volume += fill_volume
         self.position += fill_volume
         if logging:
             logger.print(f"BID {self.name} {int(price)} x{fill_volume}")
 
     def ask(self, price, quantity, logging=False):
-        remaining_capacity = POS_LIMIT + self.position
+        remaining_capacity = POS_LIMIT + self.initial_position - self.sell_volume
         fill_volume = min(quantity, remaining_capacity)
         if fill_volume <= 0:
             return
         self.orders.append(Order(self.name, int(price), -fill_volume))
+        self.sell_volume += fill_volume
         self.position -= fill_volume
         if logging:
             logger.print(f"ASK {self.name} {int(price)} x{fill_volume}")
@@ -137,118 +141,88 @@ class ProductTrader:
 
 # ASH_COATED_OSMIUM
 class AshTrader(ProductTrader):
-    def __init__(self, state):
+    def __init__(self, state: TradingState):
         super().__init__(ASH_SYMBOL, state)
+        self.last_fair = ACO_MU
 
     def get_orders(self):
 
         if self.wall_mid is not None:
+            # Calculate the effective K for 10 timesteps into the future
+            # You could also compute this once in __init__ to save processing time
+            LOOKAHEAD_STEPS = 10
+            effective_k = 1 - (1 - ACO_K)**LOOKAHEAD_STEPS
 
-            # AR(1) predicted fair value: shifts the quoting center toward mu
-            # when mid > mu we lean to sell; when mid < mu we lean to buy
-            fair_value = self.wall_mid + ACO_K * (ACO_MU - self.wall_mid)
-            logger.print(f"ACO_FV:{fair_value:.4f}")
+            # AR(1) predicted fair value 10 timesteps out
+            fair_value = self.wall_mid + effective_k * (ACO_MU - self.wall_mid)
+            self.last_fair = fair_value
+        else:
+            fair_value = self.last_fair
+        
+        logger.print(f"ACO_FV_10_STEP:{fair_value:.4f}")
 
-            ##########################################################
-            ####### 1. TAKING
-            ##########################################################
-            for sell_price, sell_volume in self.mkt_sell_orders.items():
-                if sell_price <= fair_value - 1:
-                    self.bid(sell_price, sell_volume, logging=False)
-                elif sell_price <= fair_value and self.initial_position < 0:
-                    defensive_volume = min(sell_volume, abs(self.initial_position))
-                    self.bid(sell_price, defensive_volume, logging=False)
 
-            for buy_price, buy_volume in self.mkt_buy_orders.items():
-                if buy_price >= fair_value + 1:
-                    self.ask(buy_price, buy_volume, logging=False)
-                elif buy_price >= fair_value and self.initial_position > 0:
-                    defensive_volume = min(buy_volume, self.initial_position)
-                    self.ask(buy_price, defensive_volume, logging=False)
+        ##########################################################
+        ####### 1. TAKING
+        ##########################################################
+        for sell_price, sell_volume in self.mkt_sell_orders.items():
+            if sell_price <= fair_value - 1:
+                self.bid(sell_price, sell_volume, logging=False)
+            elif sell_price <= fair_value and self.initial_position < 0:
+                defensive_volume = min(sell_volume, abs(self.initial_position))
+                self.bid(sell_price, defensive_volume, logging=False)
 
-            ###########################################################
-            ####### 2. MAKING
-            ###########################################################
-            bid_price = int(self.bid_wall + 1)
-            ask_price = int(self.ask_wall - 1)
+        for buy_price, buy_volume in self.mkt_buy_orders.items():
+            if buy_price >= fair_value + 1:
+                self.ask(buy_price, buy_volume, logging=False)
+            elif buy_price >= fair_value and self.initial_position > 0:
+                defensive_volume = min(buy_volume, self.initial_position)
+                self.ask(buy_price, defensive_volume, logging=False)
 
-            # OVERBIDDING: overbid best bid that is still under fair value
-            for buy_price, buy_volume in self.mkt_buy_orders.items():
-                overbidding_price = buy_price + 1
-                if buy_volume > 1 and overbidding_price < fair_value:
-                    bid_price = max(bid_price, overbidding_price)
-                    break
-                elif buy_price < fair_value:
-                    bid_price = max(bid_price, buy_price)
-                    break
+        ###########################################################
+        ####### 2. MAKING
+        ###########################################################
+        best_remaining_bid = next((p for p in self.mkt_buy_orders if p <= fair_value), None)
+        best_remaining_ask = next((p for p in self.mkt_sell_orders if p >= fair_value), None)
 
-            # UNDERBIDDING: underbid best ask that is still over fair value
-            for sell_price, sell_volume in self.mkt_sell_orders.items():
-                underbidding_price = sell_price - 1
-                if sell_volume > 1 and underbidding_price > fair_value:
-                    ask_price = min(ask_price, underbidding_price)
-                    break
-                elif sell_price > fair_value:
-                    ask_price = min(ask_price, sell_price)
-                    break
+        # position already reflects taker fills from step 1
+        bid_ceiling = int(fair_value) if self.position < 0 else int(fair_value - 1)
+        ask_floor   = int(fair_value) if self.position > 0 else int(fair_value + 1)
 
-            # POST ORDERS — capture volumes before bid() mutates self.position
-            maker_buy_volume  = self.max_allowed_buy_volume
-            maker_sell_volume = self.max_allowed_sell_volume
-            self.bid(bid_price, maker_buy_volume)
-            self.ask(ask_price, maker_sell_volume)
+        bid_price = min((best_remaining_bid + 1) if best_remaining_bid is not None else int(fair_value - 1), bid_ceiling)
+        ask_price = max((best_remaining_ask - 1) if best_remaining_ask is not None else int(fair_value + 1), ask_floor)
 
+        maker_buy_volume  = self.max_allowed_buy_volume
+        maker_sell_volume = self.max_allowed_sell_volume
+        self.bid(bid_price, maker_buy_volume)
+        self.ask(ask_price, maker_sell_volume)
+        
         return {self.name: self.orders}
 
+
+IPR_MAX_SPREAD = 7
 
 # INTARIAN_PEPPER_ROOT
 class RootTrader(ProductTrader):
-    def __init__(self, state, end_of_day_fair_value):
+    def __init__(self, state, end_of_day_fair_value, current_fair_value):
         super().__init__(ROOT_SYMBOL, state)
         self.end_of_day_fair_value = end_of_day_fair_value
+        self.current_fair_value = current_fair_value
 
     def get_orders(self):
-        # if order_depth.sell_orders:
-        #     # Find best ask
-        #     best_ask = min(order_depth.sell_orders.keys())
-            
-        #     # Calculate mid price safely
-        #     if order_depth.buy_orders:
-        #         best_bid = max(order_depth.buy_orders.keys())
-        #         mid_price = (best_bid + best_ask) / 2.0
-        #     else:
-        #         mid_price = best_ask  # Safe fallback if no bids exist
-            
-        #     # Buy up to inventory constraints
-        #     for ask_price in sorted(order_depth.sell_orders.keys()):
-        #         # Condition: Take only the best ask OR if the ask is within 8 units from mid
-        #         if ask_price == best_ask or ask_price <= (mid_price + 8):
-        #             can_buy = POS_LIMIT - position
-        #             if can_buy <= 0:
-        #                 break
-                    
-        #             # order_depth.sell_orders volume is negative, so we use min(-volume, limit)
-        #             quantity = min(-order_depth.sell_orders[ask_price], can_buy)
-        #             orders.append(Order(symbol, ask_price, quantity))
-        #             position += quantity
-        #         else:
-        #             # Since we iterate in sorted order, if this ask is too far, 
-        #             # subsequent ones will be even further.
-        #             break
-                    
-        # result[symbol] = orders
-    
-        # Buy and hold: accumulate long at any ask below end-of-day fair value.
-        # end_of_day_fair_value = fv_start + 999900*slope ≈ fv_start + 1000.
-        # Market trades ~1000 below this all day, so the gate always passes —
-        # it is equivalent to always buying but makes the FV comparison explicit.
-        for sell_price, sell_volume in self.mkt_sell_orders.items():
-            if sell_price >= self.end_of_day_fair_value:
+        for ask_price, ask_volume in self.mkt_sell_orders.items():
+            if ask_price < self.end_of_day_fair_value and ask_price <= self.current_fair_value + IPR_MAX_SPREAD:
+                self.bid(ask_price, ask_volume)
+            else:
                 break
-            self.bid(sell_price, sell_volume)
+
+        for bid_price, bid_volume in self.mkt_buy_orders.items():
+            if bid_price > self.end_of_day_fair_value and bid_price >= self.current_fair_value - IPR_MAX_SPREAD:
+                self.ask(bid_price, bid_volume)
+            else:
+                break
 
         return {self.name: self.orders}
-
 
 ####### MAIN #######
 
@@ -267,6 +241,9 @@ class Trader:
                 self._ipr_fv_start = 10000.0
         return self._ipr_fv_start + IPR_MAX_TS * IPR_SLOPE
 
+    def _ipr_fv_now(self, timestamp):
+        return self._ipr_fv_start + timestamp * IPR_SLOPE
+
     def run(self, state: TradingState):
         result = {}
 
@@ -279,7 +256,8 @@ class Trader:
 
                 elif symbol == ROOT_SYMBOL:
                     end_of_day_fair_value = self._ipr_fv_eod(order_depth, state.timestamp)
-                    result.update(RootTrader(state, end_of_day_fair_value).get_orders())
+                    current_fair_value = self._ipr_fv_now(state.timestamp)
+                    result.update(RootTrader(state, end_of_day_fair_value, current_fair_value).get_orders())
 
             except Exception as e:
                 logger.print(f"ERROR {symbol}: {e}")
