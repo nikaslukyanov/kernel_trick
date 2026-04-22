@@ -42,9 +42,28 @@ def load_rust_run(run_dir):
             fills.append({'timestamp': r['timestamp'], 'symbol': r['symbol'], 'price': r['price'], 'qty': -r['quantity']})
     fills_df = pd.DataFrame(fills) if fills else pd.DataFrame(columns=['timestamp', 'symbol', 'price', 'qty'])
 
+    # Parse own orders from submission.log (same format as old backtester)
+    own_orders = []
+    log_path = run_dir / 'submission.log'
+    if log_path.exists():
+        with open(log_path) as f:
+            data = json.load(f)
+        for entry in data.get('logs', []):
+            raw = entry.get('lambdaLog', '')
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(raw)
+                ts = parsed[0][0]
+                for symbol, price, qty in parsed[1]:
+                    own_orders.append({'timestamp': ts, 'symbol': symbol, 'price': price, 'qty': qty})
+            except Exception:
+                pass
+    orders_df = pd.DataFrame(own_orders) if own_orders else pd.DataFrame(columns=['timestamp', 'symbol', 'price', 'qty'])
+
     pnl_df = pd.read_csv(run_dir / 'pnl_by_product.csv', sep=';')
 
-    return activity, fills_df, pnl_df
+    return activity, fills_df, pnl_df, orders_df
 
 
 def load_old_log(path):
@@ -95,9 +114,15 @@ def build_figure(activities, fills_df, pnl_df=None, orders_df=None, sample=1, th
 
         def fmt(row):
             parts = []
-            if pd.notna(row['mid_price']):   parts.append(f"<b>mid</b>: {row['mid_price']:.1f}")
-            if pd.notna(row['bid_price_1']): parts.append(f"<b>mkt bid</b>: {row['bid_price_1']:.0f}")
-            if pd.notna(row['ask_price_1']): parts.append(f"<b>mkt ask</b>: {row['ask_price_1']:.0f}")
+            if pd.notna(row['mid_price']): parts.append(f"<b>mid</b>: {row['mid_price']:.1f}")
+            for lvl in [1, 2, 3]:
+                bp, bv = row.get(f'bid_price_{lvl}'), row.get(f'bid_volume_{lvl}')
+                if pd.notna(bp) and bp != 0:
+                    parts.append(f"<b>bid{lvl}</b>: {bp:.0f} x{bv:.0f}")
+            for lvl in [1, 2, 3]:
+                ap, av = row.get(f'ask_price_{lvl}'), row.get(f'ask_volume_{lvl}')
+                if pd.notna(ap) and ap != 0:
+                    parts.append(f"<b>ask{lvl}</b>: {ap:.0f} x{av:.0f}")
             return "<br>".join(parts)
 
         hover = mkt_plot.apply(fmt, axis=1)
@@ -230,8 +255,8 @@ def update(backend, run_path, sample_rate, theme):
     if not run_path:
         return go.Figure(), {}
     if backend == 'rust':
-        activities, fills_df, pnl_df = load_rust_run(run_path)
-        fig = build_figure(activities, fills_df, pnl_df=pnl_df, orders_df=None, sample=int(sample_rate), theme=theme)
+        activities, fills_df, pnl_df, orders_df = load_rust_run(run_path)
+        fig = build_figure(activities, fills_df, pnl_df=pnl_df, orders_df=orders_df, sample=int(sample_rate), theme=theme)
     else:
         activities, orders_df, fills_df, _ = load_old_log(run_path)
         fig = build_figure(activities, fills_df, pnl_df=None, orders_df=orders_df, sample=int(sample_rate), theme=theme)
