@@ -113,7 +113,7 @@ def build_figure(activities, fills_df, pnl_df=None, orders_df=None, sample=1, th
         mkt_plot = mkt.iloc[::sample]
 
         def fmt(row):
-            parts = []
+            parts = [f"<b>tick</b>: {int(row['timestamp'])}"]
             if pd.notna(row['mid_price']): parts.append(f"<b>mid</b>: {row['mid_price']:.1f}")
             for lvl in [1, 2, 3]:
                 bp, bv = row.get(f'bid_price_{lvl}'), row.get(f'bid_volume_{lvl}')
