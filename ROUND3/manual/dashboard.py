@@ -55,8 +55,8 @@ def mean_of(pmf: np.ndarray) -> float:
 
 
 def ev_scalar(b1: int, b2: int, a2: float):
-    p1 = P_RES[GRID <= b1].sum()
-    p2 = P_RES[(GRID > b1) & (GRID <= b2)].sum()
+    p1 = P_RES[GRID < b1].sum()
+    p2 = P_RES[(GRID >= b1) & (GRID < b2)].sum()
     if b2 >= 920:
         pen = 0.0
     else:
@@ -72,11 +72,11 @@ print("Precomputing EV tensor…")
 EV_TENSOR = np.full((N, N, N), np.nan)
 for _k in range(N):
     _a2 = float(GRID[_k])
-    _p1 = np.array([P_RES[GRID <= b1].sum() for b1 in GRID])
+    _p1 = np.array([P_RES[GRID < b1].sum() for b1 in GRID])
     for _i in range(N):
         for _j in range(_i, N):
             _b2 = int(GRID[_j])
-            _p2 = P_RES[(GRID > GRID[_i]) & (GRID <= GRID[_j])].sum()
+            _p2 = P_RES[(GRID >= GRID[_i]) & (GRID < GRID[_j])].sum()
             _pen = (0.0 if _b2 >= 920
                     else (1.0 if _b2 >= _a2
                           else ((920 - _a2) / (920 - _b2)) ** 3))
@@ -85,32 +85,13 @@ for _k in range(N):
 print("EV tensor ready.")
 
 
-def optimize_robust(a2_pmf: np.ndarray, method: str, alpha: float = 0.2):
+def optimize_robust(a2_pmf: np.ndarray):
     """Return (obj_value, b1*, b2*, point_ev_at_E[a2])."""
-    if method == "expected":
-        # weighted sum over scenarios: shape (N, N)
-        ev_mat = np.einsum("k,kij->ij", a2_pmf, np.nan_to_num(EV_TENSOR, nan=-1e9))
-        ev_mat[np.isnan(EV_TENSOR[0])] = -np.inf   # mask b2<b1 positions
-        flat = np.argmax(ev_mat)
-        i_star, j_star = divmod(int(flat), N)
-        obj_v = float(ev_mat[i_star, j_star])
-    else:  # cvar
-        # For each valid (i,j), compute CVaR over scenario distribution
-        best_v, i_star, j_star = -np.inf, 0, N - 1
-        for i in range(N):
-            for j in range(i, N):
-                evs_ij = EV_TENSOR[:, i, j]   # (N,) EV across a2 scenarios
-                order = np.argsort(evs_ij)
-                cumw = np.cumsum(a2_pmf[order])
-                mask = cumw <= alpha
-                if not mask.any():
-                    mask[0] = True
-                w = a2_pmf[order] * mask
-                v = float(np.dot(evs_ij[order], w) / max(w.sum(), 1e-12))
-                if v > best_v:
-                    best_v, i_star, j_star = v, i, j
-        obj_v = best_v
-
+    ev_mat = np.einsum("k,kij->ij", a2_pmf, np.nan_to_num(EV_TENSOR, nan=-1e9))
+    ev_mat[np.isnan(EV_TENSOR[0])] = -np.inf
+    flat = np.argmax(ev_mat)
+    i_star, j_star = divmod(int(flat), N)
+    obj_v = float(ev_mat[i_star, j_star])
     b1_star = int(GRID[i_star])
     b2_star = int(GRID[j_star])
     e_a2 = mean_of(a2_pmf)
@@ -304,18 +285,6 @@ app.layout = html.Div(
                     html.H3("avg_b2 prior — uncertainty about mean opponent bid", style=h_style),
                     html.P("Your belief about what avg_b2 will be. Used for robust optimization.",
                            style=sub_style),
-                    dcc.RadioItems(
-                        id="a2-mode",
-                        options=[
-                            {"label": "  Derived — point mass at mean of b2 distro above",
-                             "value": "derived"},
-                            {"label": "  Draw directly", "value": "direct"},
-                        ],
-                        value="direct",
-                        style={"color": TEXT, "fontSize": "12px", "marginBottom": "10px"},
-                        inputStyle={"marginRight": "4px"},
-                        labelStyle={"display": "block", "marginBottom": "4px"},
-                    ),
                     html.Div(id="a2-chart-wrapper", children=[
                         dcc.Graph(id="a2-distro",
                                   figure=fig_a2_distro(_DEFAULT_A2_PMF),
@@ -360,39 +329,12 @@ app.layout = html.Div(
                 html.H3("Recommended bids", style=h_style),
                 html.P("Updates live as you redraw.", style=sub_style),
 
-                # Method
-                html.Div(style={"marginBottom": "12px"}, children=[
-                    html.Div("OPTIMIZATION METHOD", style={"color": MUTED, "fontSize": "10px",
-                                                            "letterSpacing": "2px", "marginBottom": "6px"}),
-                    dcc.RadioItems(
-                        id="method",
-                        options=[
-                            {"label": "  Expected EV (Bayesian)", "value": "expected"},
-                            {"label": "  CVaR — tail-risk aware", "value": "cvar"},
-                        ],
-                        value="expected",
-                        style={"color": TEXT, "fontSize": "12px"},
-                        inputStyle={"marginRight": "4px"},
-                        labelStyle={"display": "block", "marginBottom": "4px"},
-                    ),
-                    html.Div(id="alpha-row",
-                             style={"marginTop": "8px", "display": "none",
-                                    "gap": "8px", "alignItems": "center"}, children=[
-                        _lbl("CVaR α (worst fraction):"),
-                        dcc.Slider(id="alpha-slider", min=0.05, max=1.0, step=0.05, value=0.2,
-                                   marks={0.1: "10%", 0.25: "25%", 0.5: "50%", 1.0: "100%"},
-                                   tooltip={"placement": "bottom", "always_visible": False}),
-                        html.Span(id="alpha-label", style={"color": GREEN, "fontSize": "11px",
-                                                            "minWidth": "34px"}),
-                    ]),
-                ]),
 
                 # Bids box
                 html.Div(style={"border": f"1px solid {GOLD}", "padding": "14px",
                                 "borderRadius": "6px"}, children=[
-                    html.Div(id="method-label",
-                             style={"color": GOLD, "fontSize": "10px",
-                                    "letterSpacing": "2px", "textAlign": "center"}),
+                    html.Div("— OPTIMAL BIDS —", style={"color": GOLD, "fontSize": "10px",
+                                                          "letterSpacing": "2px", "textAlign": "center"}),
                     html.Div(style={"display": "flex", "justifyContent": "space-around",
                                     "marginTop": "10px"}, children=[
                         html.Div([html.Div("b1*", style={"color": MUTED, "fontSize": "10px",
@@ -403,7 +345,7 @@ app.layout = html.Div(
                                                           "letterSpacing": "2px"}),
                                   html.Div(id="b2-out", style={"color": GREEN, "fontSize": "30px",
                                                                 "fontWeight": 600})]),
-                        html.Div([html.Div(id="ev-label", style={"color": MUTED, "fontSize": "10px",
+                        html.Div([html.Div("EV @ E[avg]", style={"color": MUTED, "fontSize": "10px",
                                                                    "letterSpacing": "2px"}),
                                   html.Div(id="ev-out", style={"color": GOLD, "fontSize": "30px",
                                                                 "fontWeight": 600})]),
@@ -474,29 +416,6 @@ app.layout = html.Div(
 # ---- callbacks -------------------------------------------------------------
 
 
-@app.callback(
-    Output("alpha-row", "style"),
-    Input("method", "value"),
-)
-def toggle_alpha(method):
-    base = {"marginTop": "8px", "gap": "8px", "alignItems": "center"}
-    return {**base, "display": "flex"} if method == "cvar" else {**base, "display": "none"}
-
-
-@app.callback(
-    Output("alpha-label", "children"),
-    Input("alpha-slider", "value"),
-)
-def alpha_label(v):
-    return f"{int((v or 0.2) * 100)}%"
-
-
-@app.callback(
-    Output("a2-chart-wrapper", "style"),
-    Input("a2-mode", "value"),
-)
-def toggle_a2_chart(mode):
-    return {"display": "block"} if mode == "direct" else {"display": "none"}
 
 
 # b2 distribution -----------------------------------------------------------
@@ -570,7 +489,6 @@ _A2_DIRECT_TRIGGERS = {
     Input("btn-a2-beta", "n_clicks"),
     Input("btn-a2-clear", "n_clicks"),
     Input("a2-distro", "relayoutData"),
-    Input("a2-mode", "value"),
     Input("pmf-store", "data"),
     State("mu-a2", "value"),
     State("sigma-a2", "value"),
@@ -580,18 +498,11 @@ _A2_DIRECT_TRIGGERS = {
     prevent_initial_call=True,
 )
 def update_a2_pmf(_nash, _l0, _uni, _norm, _beta_btn, _clr, relayout,
-                  mode, b2_pmf_data, mu_a2, sigma_a2, ba, bb, current):
+                  b2_pmf_data, mu_a2, sigma_a2, ba, bb, current):
     trig = ctx.triggered_id
     pmf = np.array(current) if current else _DEFAULT_A2_PMF.copy()
 
-    # Derived mode: always snap a2 prior to point at b2 distro mean
-    if mode == "derived":
-        b2_pmf = np.array(b2_pmf_data) if b2_pmf_data else uniform_pmf()
-        pmf = point_pmf(mean_of(b2_pmf))
-        return pmf.tolist(), fig_a2_distro(pmf), no_update, no_update
-
-    # Direct mode: respond to explicit a2 controls
-    clear_b2 = trig in _A2_DIRECT_TRIGGERS   # reset b2 distro when user works in a2 panel
+    clear_b2 = trig in _A2_DIRECT_TRIGGERS
 
     if trig == "btn-a2-nash":
         pmf = point_pmf(835)
@@ -626,10 +537,6 @@ def update_a2_pmf(_nash, _l0, _uni, _norm, _beta_btn, _clr, relayout,
         if not found and not shapes:
             # pure pan/zoom — no draw, don't clear either
             return no_update, no_update, no_update, no_update
-    elif trig == "a2-mode":
-        if mode == "direct":
-            return no_update, no_update, uniform_pmf().tolist(), fig_b2_empty()
-        return no_update, no_update, no_update, no_update
     elif trig == "pmf-store":
         return no_update, no_update, no_update, no_update
     else:
@@ -647,8 +554,6 @@ def update_a2_pmf(_nash, _l0, _uni, _norm, _beta_btn, _clr, relayout,
     Output("b1-out", "children"),
     Output("b2-out", "children"),
     Output("ev-out", "children"),
-    Output("ev-label", "children"),
-    Output("method-label", "children"),
     Output("a2-out", "children"),
     Output("ev-point-out", "children"),
     Output("pen-out", "children"),
@@ -661,16 +566,13 @@ def update_a2_pmf(_nash, _l0, _uni, _norm, _beta_btn, _clr, relayout,
     Output("nitems-out", "children"),
     Output("grand-out", "children"),
     Input("a2-pmf-store", "data"),
-    Input("method", "value"),
-    Input("alpha-slider", "value"),
     Input("n-per-atom", "value"),
     Input("items-per", "value"),
 )
-def refresh(a2_pmf_data, method, alpha, n_per_atom, items_per):
+def refresh(a2_pmf_data, n_per_atom, items_per):
     a2_pmf = np.array(a2_pmf_data) if a2_pmf_data else _DEFAULT_A2_PMF.copy()
-    alpha = float(alpha or 0.2)
 
-    obj_v, b1_star, b2_star, ev_point = optimize_robust(a2_pmf, method, alpha)
+    obj_v, b1_star, b2_star, ev_point = optimize_robust(a2_pmf)
 
     e_a2 = mean_of(a2_pmf)
     _, pnl1, pnl2, p1, p2, pen = ev_scalar(b1_star, b2_star, e_a2)
@@ -681,14 +583,10 @@ def refresh(a2_pmf_data, method, alpha, n_per_atom, items_per):
     n_tot = n_gard * n_item
     grand = ev_point * n_tot
 
-    ev_lbl = "EV @ E[avg]"
-    mth_lbl = ("— EXPECTED EV OPTIMAL —" if method == "expected"
-               else f"— CVaR α={int(alpha*100)}% OPTIMAL —")
-
     return (
         fig_sensitivity(b1_star, b2_star, a2_pmf),
         f"{b1_star}", f"{b2_star}", f"{ev_point:,.1f}",
-        ev_lbl, mth_lbl, f"{e_a2:.1f}", f"{obj_v:,.2f}", f"{pen:.3f}",
+        f"{e_a2:.1f}", f"{obj_v:,.2f}", f"{pen:.3f}",
         f"{p1*100:.1f}%", f"{p2*100:.1f}%", f"{(1-p1-p2)*100:.1f}%",
         f"{pnl1:,.2f}", f"{pnl2:,.2f}",
         f"{n_gard:,.0f}", f"{n_tot:,.0f}", f"{grand:,.2f}",
