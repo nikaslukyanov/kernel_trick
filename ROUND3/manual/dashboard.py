@@ -1,8 +1,8 @@
 """
-Gardener Guild dashboard.
+Gardener Guild dashboard — robust bid optimizer.
 
 Run:
-    pip3 install dash plotly numpy
+    pip3 install dash plotly numpy scipy
     python3 ROUND3/manual/dashboard.py
 
 Opens http://127.0.0.1:8050
@@ -11,14 +11,15 @@ from __future__ import annotations
 
 import re
 import numpy as np
+from scipy.stats import beta as beta_dist
 from dash import Dash, dcc, html, Input, Output, State, ctx, no_update
 import plotly.graph_objects as go
 
 # ---- model -----------------------------------------------------------------
 
 GRID = np.arange(670, 921, 5)
-N = len(GRID)               # 51
-P_RES = np.full(N, 1 / N)   # fixed uniform reserve PMF per spec
+N = len(GRID)
+P_RES = np.full(N, 1 / N)
 
 
 def uniform_pmf() -> np.ndarray:
@@ -29,6 +30,13 @@ def normal_pmf(mu: float, sigma: float) -> np.ndarray:
     sigma = max(sigma, 1e-6)
     w = np.exp(-0.5 * ((GRID - mu) / sigma) ** 2)
     return w / w.sum()
+
+
+def beta_pmf(a: float, b: float) -> np.ndarray:
+    t = np.clip((GRID - 670) / 250, 1e-6, 1 - 1e-6)
+    w = beta_dist.pdf(t, max(a, 1e-3), max(b, 1e-3))
+    s = w.sum()
+    return w / s if s > 0 else uniform_pmf()
 
 
 def bimodal_pmf() -> np.ndarray:
@@ -46,11 +54,11 @@ def mean_of(pmf: np.ndarray) -> float:
     return float((GRID * pmf).sum())
 
 
-def ev(b1: int, b2: int, a2: float):
+def ev_scalar(b1: int, b2: int, a2: float):
     p1 = P_RES[GRID <= b1].sum()
     p2 = P_RES[(GRID > b1) & (GRID <= b2)].sum()
     if b2 >= 920:
-        pen = 0.0  # no margin anyway
+        pen = 0.0
     else:
         pen = 1.0 if b2 >= a2 else ((920 - a2) / (920 - b2)) ** 3
     pnl1 = p1 * (920 - b1)
@@ -58,14 +66,56 @@ def ev(b1: int, b2: int, a2: float):
     return pnl1 + pnl2, pnl1, pnl2, p1, p2, pen
 
 
-def optimize(a2: float):
-    best_v, best_b1, best_b2 = -1.0, int(GRID[0]), int(GRID[-1])
-    for b1 in GRID:
-        for b2 in GRID[GRID >= b1]:
-            v, *_ = ev(int(b1), int(b2), a2)
-            if v > best_v:
-                best_v, best_b1, best_b2 = v, int(b1), int(b2)
-    return best_v, best_b1, best_b2
+# Precompute EV_TENSOR[k, i, j] = EV(b1=GRID[i], b2=GRID[j], avg_b2=GRID[k])
+# NaN where j < i (b2 < b1). Shape (N, N, N). Built once at startup.
+print("Precomputing EV tensor…")
+EV_TENSOR = np.full((N, N, N), np.nan)
+for _k in range(N):
+    _a2 = float(GRID[_k])
+    _p1 = np.array([P_RES[GRID <= b1].sum() for b1 in GRID])
+    for _i in range(N):
+        for _j in range(_i, N):
+            _b2 = int(GRID[_j])
+            _p2 = P_RES[(GRID > GRID[_i]) & (GRID <= GRID[_j])].sum()
+            _pen = (0.0 if _b2 >= 920
+                    else (1.0 if _b2 >= _a2
+                          else ((920 - _a2) / (920 - _b2)) ** 3))
+            EV_TENSOR[_k, _i, _j] = (_p1[_i] * (920 - GRID[_i])
+                                      + _p2 * (920 - _b2) * _pen)
+print("EV tensor ready.")
+
+
+def optimize_robust(a2_pmf: np.ndarray, method: str, alpha: float = 0.2):
+    """Return (obj_value, b1*, b2*, point_ev_at_E[a2])."""
+    if method == "expected":
+        # weighted sum over scenarios: shape (N, N)
+        ev_mat = np.einsum("k,kij->ij", a2_pmf, np.nan_to_num(EV_TENSOR, nan=-1e9))
+        ev_mat[np.isnan(EV_TENSOR[0])] = -np.inf   # mask b2<b1 positions
+        flat = np.argmax(ev_mat)
+        i_star, j_star = divmod(int(flat), N)
+        obj_v = float(ev_mat[i_star, j_star])
+    else:  # cvar
+        # For each valid (i,j), compute CVaR over scenario distribution
+        best_v, i_star, j_star = -np.inf, 0, N - 1
+        for i in range(N):
+            for j in range(i, N):
+                evs_ij = EV_TENSOR[:, i, j]   # (N,) EV across a2 scenarios
+                order = np.argsort(evs_ij)
+                cumw = np.cumsum(a2_pmf[order])
+                mask = cumw <= alpha
+                if not mask.any():
+                    mask[0] = True
+                w = a2_pmf[order] * mask
+                v = float(np.dot(evs_ij[order], w) / max(w.sum(), 1e-12))
+                if v > best_v:
+                    best_v, i_star, j_star = v, i, j
+        obj_v = best_v
+
+    b1_star = int(GRID[i_star])
+    b2_star = int(GRID[j_star])
+    e_a2 = mean_of(a2_pmf)
+    point_ev = float(EV_TENSOR[int(np.argmin(np.abs(GRID - e_a2))), i_star, j_star])
+    return obj_v, b1_star, b2_star, point_ev
 
 
 # ---- path -> pmf -----------------------------------------------------------
@@ -81,23 +131,17 @@ def path_to_pmf(path: str) -> np.ndarray | None:
     ys = np.clip(np.array([p[1] for p in pts]), 0, None)
     order = np.argsort(xs)
     xs, ys = xs[order], ys[order]
-    # average duplicate x
     ux, inv = np.unique(xs, return_inverse=True)
-    uy = np.zeros_like(ux)
-    cnt = np.zeros_like(ux)
-    for i, j in enumerate(inv):
-        uy[j] += ys[i]
-        cnt[j] += 1
-    uy = uy / np.maximum(cnt, 1)
+    uy, cnt = np.zeros_like(ux), np.zeros_like(ux)
+    for ii, jj in enumerate(inv):
+        uy[jj] += ys[ii]
+        cnt[jj] += 1
+    uy /= np.maximum(cnt, 1)
     if len(ux) < 2:
         return None
-    # interpolate onto GRID, clamp endpoints
-    pmf = np.interp(GRID, ux, uy, left=0.0, right=0.0)
-    pmf = np.clip(pmf, 0, None)
+    pmf = np.clip(np.interp(GRID, ux, uy, left=0.0, right=0.0), 0, None)
     s = pmf.sum()
-    if s <= 0:
-        return None
-    return pmf / s
+    return pmf / s if s > 0 else None
 
 
 # ---- styling ---------------------------------------------------------------
@@ -109,61 +153,83 @@ GOLD = "#d4a84a"
 MUTED = "#7b8aa1"
 TEXT = "#e6edf7"
 GREEN = "#6fbf87"
-
+RED = "#e07070"
 FONT = "ui-monospace, SFMono-Regular, Menlo, monospace"
 
+_base_layout = dict(
+    paper_bgcolor=PANEL, plot_bgcolor=PANEL,
+    font=dict(family=FONT, color=TEXT, size=11),
+    margin=dict(l=40, r=20, t=20, b=30),
+    showlegend=False, bargap=0.02,
+    xaxis=dict(gridcolor="#1b2740", zeroline=False),
+    yaxis=dict(gridcolor="#1b2740", zeroline=False),
+)
 
-def fig_distro(pmf: np.ndarray) -> go.Figure:
-    cdf = np.cumsum(pmf)
+
+def fig_b2_empty() -> go.Figure:
     fig = go.Figure()
-    fig.add_bar(
-        x=GRID, y=pmf, marker_color=TEAL, opacity=0.75, name="density f(p)",
-        hovertemplate="b2=%{x}<br>p=%{y:.4f}<extra></extra>",
-    )
-    fig.add_scatter(
-        x=GRID, y=cdf * pmf.max() / max(cdf.max(), 1e-9),
-        mode="lines", line=dict(color=GOLD, dash="dash"), name="CDF (scaled)",
-        hoverinfo="skip",
-    )
-    a2 = mean_of(pmf)
-    fig.add_vline(x=a2, line=dict(color=GOLD, width=1),
-                  annotation_text=f"avg_b2 = {a2:.2f}",
-                  annotation_position="top left",
-                  annotation_font_color=GOLD)
-    fig.update_layout(
-        dragmode="drawopenpath",
-        newshape=dict(line=dict(color=GOLD, width=2)),
-        paper_bgcolor=PANEL, plot_bgcolor=PANEL,
-        font=dict(family=FONT, color=TEXT, size=11),
-        margin=dict(l=40, r=20, t=20, b=30), height=320,
-        xaxis=dict(gridcolor="#1b2740", zeroline=False, title="b2 bid (counterparty)"),
-        yaxis=dict(gridcolor="#1b2740", zeroline=False, title="density f(p)"),
-        showlegend=False, bargap=0.02,
-    )
+    layout = {**_base_layout, "height": 270,
+              "xaxis": dict(range=[670, 920], gridcolor="#1b2740", zeroline=False,
+                            title="opponent b2 bid"),
+              "yaxis": dict(gridcolor="#1b2740", zeroline=False, title="density")}
+    fig.update_layout(**layout)
     return fig
 
 
-def fig_ev_curve(pmf: np.ndarray, b1_star: int, b2_star: int) -> go.Figure:
+def fig_b2_distro(pmf: np.ndarray) -> go.Figure:
+    cdf = np.cumsum(pmf)
     a2 = mean_of(pmf)
-    ys = []
-    for b2 in GRID[GRID >= b1_star]:
-        v, *_ = ev(b1_star, int(b2), a2)
-        ys.append(v)
-    xs = GRID[GRID >= b1_star]
     fig = go.Figure()
-    fig.add_scatter(x=xs, y=ys, mode="lines", line=dict(color=TEAL, width=2),
-                    name="E[PnL]", hovertemplate="b2=%{x}<br>EV=%{y:.2f}<extra></extra>")
-    fig.add_scatter(x=[b2_star], y=[ev(b1_star, b2_star, a2)[0]],
-                    mode="markers", marker=dict(color=GOLD, size=10),
-                    hoverinfo="skip", showlegend=False)
-    fig.update_layout(
-        paper_bgcolor=PANEL, plot_bgcolor=PANEL,
-        font=dict(family=FONT, color=TEXT, size=11),
-        margin=dict(l=40, r=20, t=20, b=30), height=220,
-        xaxis=dict(gridcolor="#1b2740", zeroline=False, title=f"b2 (b1 held at joint-optimum {b1_star})"),
-        yaxis=dict(gridcolor="#1b2740", zeroline=False, title="E[PnL] per counterparty"),
-        showlegend=False,
-    )
+    fig.add_bar(x=GRID, y=pmf, marker_color=TEAL, opacity=0.75,
+                hovertemplate="b2=%{x}<br>p=%{y:.4f}<extra></extra>")
+    fig.add_scatter(x=GRID, y=cdf * pmf.max() / max(cdf.max(), 1e-9),
+                    mode="lines", line=dict(color=GOLD, dash="dash"), hoverinfo="skip")
+    fig.add_vline(x=a2, line=dict(color=GOLD, width=1),
+                  annotation_text=f"mean={a2:.1f}",
+                  annotation_position="top left", annotation_font_color=GOLD)
+    fig.update_layout(**_base_layout, dragmode="drawopenpath",
+                      newshape=dict(line=dict(color=GOLD, width=2)), height=270,
+                      xaxis_title="opponent b2 bid", yaxis_title="density")
+    return fig
+
+
+def fig_a2_distro(pmf: np.ndarray) -> go.Figure:
+    a2 = mean_of(pmf)
+    fig = go.Figure()
+    fig.add_bar(x=GRID, y=pmf, marker_color=GREEN, opacity=0.75,
+                hovertemplate="avg_b2=%{x}<br>p=%{y:.4f}<extra></extra>")
+    fig.add_vline(x=a2, line=dict(color=GOLD, width=1),
+                  annotation_text=f"E[avg_b2]={a2:.1f}",
+                  annotation_position="top left", annotation_font_color=GOLD)
+    fig.update_layout(**_base_layout, dragmode="drawopenpath",
+                      newshape=dict(line=dict(color=GREEN, width=2)), height=210,
+                      xaxis_title="possible avg_b2 value", yaxis_title="prior weight")
+    return fig
+
+
+def fig_sensitivity(b1: int, b2: int, a2_pmf: np.ndarray) -> go.Figure:
+    b1_idx = int(np.argmin(np.abs(GRID - b1)))
+    b2_idx = int(np.argmin(np.abs(GRID - b2)))
+    evs = EV_TENSOR[:, b1_idx, b2_idx]
+    e_a2 = mean_of(a2_pmf)
+    ev_at_e = float(np.interp(e_a2, GRID, evs))
+    pmf_scaled = a2_pmf / max(a2_pmf.max(), 1e-9) * float(np.nanmax(evs)) * 0.25
+
+    fig = go.Figure()
+    fig.add_bar(x=GRID, y=pmf_scaled, marker_color=GREEN, opacity=0.22, name="prior")
+    fig.add_scatter(x=GRID, y=evs, mode="lines", line=dict(color=TEAL, width=2),
+                    hovertemplate="avg_b2=%{x}<br>EV=%{y:.2f}<extra></extra>")
+    fig.add_vline(x=b2, line=dict(color=RED, width=1, dash="dot"),
+                  annotation_text=f"b2*={b2} (cliff)",
+                  annotation_position="top right", annotation_font_color=RED)
+    fig.add_vline(x=e_a2, line=dict(color=GOLD, width=1),
+                  annotation_text=f"E[avg]={e_a2:.0f}",
+                  annotation_position="top left", annotation_font_color=GOLD)
+    fig.add_scatter(x=[e_a2], y=[ev_at_e], mode="markers",
+                    marker=dict(color=GOLD, size=10), hoverinfo="skip")
+    fig.update_layout(**_base_layout, height=210,
+                      xaxis_title="true avg_b2 (unknown on submission day)",
+                      yaxis_title="E[PnL] per counterparty")
     return fig
 
 
@@ -172,194 +238,232 @@ def fig_ev_curve(pmf: np.ndarray, b1_star: int, b2_star: int) -> go.Figure:
 app = Dash(__name__)
 app.title = "Gardener Guild"
 
-panel_style = {
-    "background": PANEL, "padding": "16px 18px", "borderRadius": "8px",
-    "border": "1px solid #1b2740",
-}
+panel_style = {"background": PANEL, "padding": "16px 18px", "borderRadius": "8px",
+               "border": "1px solid #1b2740"}
 h_style = {"margin": "0 0 4px 0", "color": TEXT, "fontSize": "15px", "fontWeight": 600}
-sub_style = {"margin": "0 0 12px 0", "color": MUTED, "fontSize": "11px"}
-btn_style = {
-    "background": "transparent", "color": TEXT, "border": f"1px solid {MUTED}",
-    "padding": "4px 10px", "marginRight": "6px", "marginTop": "6px",
-    "borderRadius": "4px", "fontFamily": FONT, "fontSize": "11px",
-    "cursor": "pointer",
-}
+sub_style = {"margin": "0 0 10px 0", "color": MUTED, "fontSize": "11px"}
+btn_style = {"background": "transparent", "color": TEXT, "border": f"1px solid {MUTED}",
+             "padding": "4px 10px", "marginRight": "6px", "marginTop": "6px",
+             "borderRadius": "4px", "fontFamily": FONT, "fontSize": "11px", "cursor": "pointer"}
 readout_row = {"display": "flex", "justifyContent": "space-between", "padding": "6px 0",
                "borderBottom": "1px solid #1b2740", "fontSize": "12px"}
+
+_DEFAULT_B2_PMF = point_pmf(835)
+_DEFAULT_A2_PMF = point_pmf(835)
+
+
+def _inp(id_, val, step=1, w="70px"):
+    return dcc.Input(id=id_, type="number", value=val, step=step,
+                     style={"width": w, "background": BG, "color": TEXT,
+                            "border": f"1px solid {MUTED}", "padding": "3px 6px",
+                            "borderRadius": "3px", "fontFamily": FONT})
+
+
+def _lbl(txt, color=MUTED):
+    return html.Span(txt, style={"color": color, "fontSize": "11px"})
+
 
 app.layout = html.Div(
     style={"background": BG, "color": TEXT, "minHeight": "100vh",
            "padding": "20px", "fontFamily": FONT},
     children=[
-        dcc.Store(id="pmf-store", data=uniform_pmf().tolist()),
-        html.Div(style={"display": "grid", "gridTemplateColumns": "1.4fr 1fr",
-                        "gap": "16px"}, children=[
-            # LEFT COL
+        dcc.Store(id="pmf-store", data=point_pmf(835).tolist()),
+        dcc.Store(id="a2-pmf-store", data=point_pmf(835).tolist()),
+
+        html.Div(style={"display": "grid", "gridTemplateColumns": "1.4fr 1fr", "gap": "16px"},
+                 children=[
+
+            # ===== LEFT COL =====
             html.Div(children=[
-                html.Div(style=panel_style, children=[
+
+                # Panel 1 — b2 distribution
+                html.Div(id="panel-b2", children=[html.Div(style=panel_style, children=[
                     html.H3("Opponent b2 distribution", style=h_style),
-                    html.P("Draw inside the plot (open path tool in toolbar) to sculpt density "
-                           "over other players' second bids. Or use presets. Reserve prices "
-                           "are fixed uniform per spec; only avg_b2 flexes.", style=sub_style),
-                    dcc.Graph(id="distro", config={
-                        "displayModeBar": True,
-                        "modeBarButtonsToAdd": ["drawopenpath", "eraseshape"],
-                        "displaylogo": False,
-                    }),
-                    html.Div(children=[
+                    html.P("Draw density over opponents' individual second bids. "
+                           "Mean auto-propagates to avg_b2 prior when mode = Derived.", style=sub_style),
+                    dcc.Graph(id="distro",
+                              figure=fig_b2_distro(_DEFAULT_B2_PMF),
+                              config={"displayModeBar": True,
+                                      "modeBarButtonsToAdd": ["drawopenpath", "eraseshape"],
+                                      "displaylogo": False}),
+                    html.Div([
                         html.Button("UNIFORM", id="btn-uniform", style=btn_style),
-                        html.Button("BIMODAL", id="btn-bimodal", style=btn_style),
-                        html.Button("POINT @ 920", id="btn-point920", style=btn_style),
-                        html.Button("POINT @ 795", id="btn-point795", style=btn_style),
-                        html.Button("CLEAR SHAPES", id="btn-clear", style=btn_style),
+                        html.Button("CLEAR", id="btn-clear", style=btn_style),
                     ]),
-                    html.Div(style={"marginTop": "12px", "display": "flex",
-                                    "gap": "8px", "alignItems": "center",
-                                    "flexWrap": "wrap"}, children=[
-                        html.Span("NORMAL", style={"color": GOLD, "fontSize": "11px"}),
-                        html.Span("μ", style={"color": MUTED, "fontSize": "11px"}),
-                        dcc.Input(id="mu", type="number", value=795, step=1,
-                                  style={"width": "70px", "background": BG,
-                                         "color": TEXT, "border": f"1px solid {MUTED}",
-                                         "padding": "3px 6px", "borderRadius": "3px",
-                                         "fontFamily": FONT}),
-                        html.Span("σ", style={"color": MUTED, "fontSize": "11px"}),
-                        dcc.Input(id="sigma", type="number", value=25, step=1,
-                                  style={"width": "70px", "background": BG,
-                                         "color": TEXT, "border": f"1px solid {MUTED}",
-                                         "padding": "3px 6px", "borderRadius": "3px",
-                                         "fontFamily": FONT}),
-                        html.Button("APPLY NORMAL", id="btn-normal",
-                                    style={**btn_style, "border": f"1px solid {GOLD}",
-                                           "color": GOLD}),
+                    html.Div(style={"marginTop": "10px", "display": "flex", "gap": "8px",
+                                    "alignItems": "center", "flexWrap": "wrap"}, children=[
+                        _lbl("NORMAL", GOLD), _lbl("μ"), _inp("mu", 795),
+                        _lbl("σ"), _inp("sigma", 25),
+                        html.Button("APPLY", id="btn-normal",
+                                    style={**btn_style, "border": f"1px solid {GOLD}", "color": GOLD}),
+                    ]),
+                ])]),
+
+                # Panel 2 — avg_b2 prior
+                html.Div(style={**panel_style, "marginTop": "14px"}, children=[
+                    html.H3("avg_b2 prior — uncertainty about mean opponent bid", style=h_style),
+                    html.P("Your belief about what avg_b2 will be. Used for robust optimization.",
+                           style=sub_style),
+                    dcc.RadioItems(
+                        id="a2-mode",
+                        options=[
+                            {"label": "  Derived — point mass at mean of b2 distro above",
+                             "value": "derived"},
+                            {"label": "  Draw directly", "value": "direct"},
+                        ],
+                        value="direct",
+                        style={"color": TEXT, "fontSize": "12px", "marginBottom": "10px"},
+                        inputStyle={"marginRight": "4px"},
+                        labelStyle={"display": "block", "marginBottom": "4px"},
+                    ),
+                    html.Div(id="a2-chart-wrapper", children=[
+                        dcc.Graph(id="a2-distro",
+                                  figure=fig_a2_distro(_DEFAULT_A2_PMF),
+                                  config={"displayModeBar": True,
+                                          "modeBarButtonsToAdd": ["drawopenpath", "eraseshape"],
+                                          "displaylogo": False}),
+                        html.Div([
+                            html.Button("NASH (835)", id="btn-a2-nash", style=btn_style),
+                            html.Button("LEVEL-0 (795)", id="btn-a2-level0", style=btn_style),
+                            html.Button("UNIFORM", id="btn-a2-uniform", style=btn_style),
+                            html.Button("CLEAR", id="btn-a2-clear", style=btn_style),
+                        ]),
+                        html.Div(style={"marginTop": "10px", "display": "flex", "gap": "8px",
+                                        "alignItems": "center", "flexWrap": "wrap"}, children=[
+                            _lbl("NORMAL", GOLD), _lbl("μ"), _inp("mu-a2", 840),
+                            _lbl("σ"), _inp("sigma-a2", 30),
+                            html.Button("APPLY", id="btn-a2-normal",
+                                        style={**btn_style, "border": f"1px solid {GOLD}", "color": GOLD}),
+                        ]),
+                        html.Div(style={"marginTop": "8px", "display": "flex", "gap": "8px",
+                                        "alignItems": "center", "flexWrap": "wrap"}, children=[
+                            _lbl("BETA (rescaled 670–920)", GREEN),
+                            _lbl("α"), _inp("beta-a", 2, step=0.1, w="60px"),
+                            _lbl("β"), _inp("beta-b", 2, step=0.1, w="60px"),
+                            html.Button("APPLY", id="btn-a2-beta",
+                                        style={**btn_style, "border": f"1px solid {GREEN}", "color": GREEN}),
+                        ]),
                     ]),
                 ]),
-                html.Div(style={**panel_style, "marginTop": "16px"}, children=[
-                    html.H3("Expected PnL vs b2", style=h_style),
-                    html.P("Fix b1 at its optimum; sweep b2. Gold dot = global optimum.",
-                           style=sub_style),
-                    dcc.Graph(id="ev-curve", config={"displayModeBar": False}),
+
+                # Panel 3 — sensitivity
+                html.Div(style={**panel_style, "marginTop": "14px"}, children=[
+                    html.H3("Sensitivity — EV vs true avg_b2", style=h_style),
+                    html.P("Teal = EV(b1*,b2*, true_avg). Green = your prior. "
+                           "Red = b2* penalty cliff. Gold dot = EV at E[avg_b2].", style=sub_style),
+                    dcc.Graph(id="sensitivity", config={"displayModeBar": False}),
                 ]),
             ]),
-            # RIGHT COL
+
+            # ===== RIGHT COL =====
             html.Div(style=panel_style, children=[
                 html.H3("Recommended bids", style=h_style),
-                html.P("Updates live as you redraw distribution.", style=sub_style),
+                html.P("Updates live as you redraw.", style=sub_style),
+
+                # Method
+                html.Div(style={"marginBottom": "12px"}, children=[
+                    html.Div("OPTIMIZATION METHOD", style={"color": MUTED, "fontSize": "10px",
+                                                            "letterSpacing": "2px", "marginBottom": "6px"}),
+                    dcc.RadioItems(
+                        id="method",
+                        options=[
+                            {"label": "  Expected EV (Bayesian)", "value": "expected"},
+                            {"label": "  CVaR — tail-risk aware", "value": "cvar"},
+                        ],
+                        value="expected",
+                        style={"color": TEXT, "fontSize": "12px"},
+                        inputStyle={"marginRight": "4px"},
+                        labelStyle={"display": "block", "marginBottom": "4px"},
+                    ),
+                    html.Div(id="alpha-row",
+                             style={"marginTop": "8px", "display": "none",
+                                    "gap": "8px", "alignItems": "center"}, children=[
+                        _lbl("CVaR α (worst fraction):"),
+                        dcc.Slider(id="alpha-slider", min=0.05, max=1.0, step=0.05, value=0.2,
+                                   marks={0.1: "10%", 0.25: "25%", 0.5: "50%", 1.0: "100%"},
+                                   tooltip={"placement": "bottom", "always_visible": False}),
+                        html.Span(id="alpha-label", style={"color": GREEN, "fontSize": "11px",
+                                                            "minWidth": "34px"}),
+                    ]),
+                ]),
+
+                # Bids box
                 html.Div(style={"border": f"1px solid {GOLD}", "padding": "14px",
-                                "borderRadius": "6px", "marginTop": "10px"}, children=[
-                    html.Div("— OPTIMAL BIDS —", style={"color": GOLD, "fontSize": "10px",
-                                                         "letterSpacing": "2px",
-                                                         "textAlign": "center"}),
+                                "borderRadius": "6px"}, children=[
+                    html.Div(id="method-label",
+                             style={"color": GOLD, "fontSize": "10px",
+                                    "letterSpacing": "2px", "textAlign": "center"}),
                     html.Div(style={"display": "flex", "justifyContent": "space-around",
                                     "marginTop": "10px"}, children=[
-                        html.Div(children=[
-                            html.Div("b1*", style={"color": MUTED, "fontSize": "10px",
-                                                    "letterSpacing": "2px"}),
-                            html.Div(id="b1-out", style={"color": TEAL, "fontSize": "30px",
-                                                          "fontWeight": 600}),
-                        ]),
-                        html.Div(children=[
-                            html.Div("b2*", style={"color": MUTED, "fontSize": "10px",
-                                                    "letterSpacing": "2px"}),
-                            html.Div(id="b2-out", style={"color": GREEN, "fontSize": "30px",
-                                                          "fontWeight": 600}),
-                        ]),
-                        html.Div(children=[
-                            html.Div("E[PnL]", style={"color": MUTED, "fontSize": "10px",
-                                                       "letterSpacing": "2px"}),
-                            html.Div(id="ev-out", style={"color": GOLD, "fontSize": "30px",
-                                                          "fontWeight": 600}),
-                        ]),
+                        html.Div([html.Div("b1*", style={"color": MUTED, "fontSize": "10px",
+                                                          "letterSpacing": "2px"}),
+                                  html.Div(id="b1-out", style={"color": TEAL, "fontSize": "30px",
+                                                                "fontWeight": 600})]),
+                        html.Div([html.Div("b2*", style={"color": MUTED, "fontSize": "10px",
+                                                          "letterSpacing": "2px"}),
+                                  html.Div(id="b2-out", style={"color": GREEN, "fontSize": "30px",
+                                                                "fontWeight": 600})]),
+                        html.Div([html.Div(id="ev-label", style={"color": MUTED, "fontSize": "10px",
+                                                                   "letterSpacing": "2px"}),
+                                  html.Div(id="ev-out", style={"color": GOLD, "fontSize": "30px",
+                                                                "fontWeight": 600})]),
                     ]),
                 ]),
-                html.Div(style={"marginTop": "18px"}, children=[
-                    html.Div("DISTRIBUTION STATS", style={"color": MUTED, "fontSize": "10px",
-                                                           "letterSpacing": "2px",
-                                                           "marginBottom": "6px"}),
+
+                html.Div(style={"marginTop": "16px"}, children=[
+                    html.Div("PRIOR STATS", style={"color": MUTED, "fontSize": "10px",
+                                                    "letterSpacing": "2px", "marginBottom": "6px"}),
                     html.Div(style=readout_row, children=[
-                        html.Span("avg_b2 (mean of opponents)"),
-                        html.Span(id="a2-out", style={"color": GOLD}),
-                    ]),
+                        html.Span("E[avg_b2] under prior  [price, 670–920]"),
+                        html.Span(id="a2-out", style={"color": GOLD})]),
                     html.Div(style=readout_row, children=[
-                        html.Span("mode of distribution"),
-                        html.Span(id="mode-out", style={"color": TEAL}),
-                    ]),
+                        html.Span("E[EV] over full prior  [pnl per counterparty]"),
+                        html.Span(id="ev-point-out", style={"color": TEAL})]),
+                    html.Div(style=readout_row, children=[
+                        html.Span("penalty factor at E[avg_b2]  [0–1]"),
+                        html.Span(id="pen-out", style={"color": GOLD})]),
                 ]),
-                html.Div(style={"marginTop": "18px"}, children=[
-                    html.Div("TRADE BREAKDOWN", style={"color": MUTED, "fontSize": "10px",
-                                                        "letterSpacing": "2px",
-                                                        "marginBottom": "6px"}),
-                    html.Div(style=readout_row, children=[
-                        html.Span("P(r ≤ b1*) — b1-leg hit rate"),
-                        html.Span(id="p1-out", style={"color": TEAL}),
-                    ]),
-                    html.Div(style=readout_row, children=[
-                        html.Span("P(b1 < r ≤ b2*) — b2-leg hit rate"),
-                        html.Span(id="p2-out", style={"color": GREEN}),
-                    ]),
-                    html.Div(style=readout_row, children=[
-                        html.Span("P(no trade)"),
-                        html.Span(id="p0-out", style={"color": MUTED}),
-                    ]),
-                    html.Div(style=readout_row, children=[
-                        html.Span("penalty factor at b2*"),
-                        html.Span(id="pen-out", style={"color": GOLD}),
-                    ]),
-                ]),
-                html.Div(style={"marginTop": "18px"}, children=[
-                    html.Div("EV DECOMPOSITION (per counterparty)",
+
+                html.Div(style={"marginTop": "16px"}, children=[
+                    html.Div("TRADE BREAKDOWN  (at E[avg_b2])",
                              style={"color": MUTED, "fontSize": "10px",
                                     "letterSpacing": "2px", "marginBottom": "6px"}),
                     html.Div(style=readout_row, children=[
-                        html.Span("b1-leg:  P·(920 − b1)"),
-                        html.Span(id="pnl1-out", style={"color": TEAL}),
-                    ]),
+                        html.Span("P(r ≤ b1*) — b1-leg"),
+                        html.Span(id="p1-out", style={"color": TEAL})]),
                     html.Div(style=readout_row, children=[
-                        html.Span("b2-leg:  P·(920 − b2)·penalty"),
-                        html.Span(id="pnl2-out", style={"color": GREEN}),
-                    ]),
+                        html.Span("P(b1 < r ≤ b2*) — b2-leg"),
+                        html.Span(id="p2-out", style={"color": GREEN})]),
                     html.Div(style=readout_row, children=[
-                        html.Span("total E[PnL] per counterparty"),
-                        html.Span(id="total-out", style={"color": GOLD, "fontWeight": 600}),
-                    ]),
+                        html.Span("P(no trade)"),
+                        html.Span(id="p0-out", style={"color": MUTED})]),
+                    html.Div(style=readout_row, children=[
+                        html.Span("b1-leg EV contribution"),
+                        html.Span(id="pnl1-out", style={"color": TEAL})]),
+                    html.Div(style=readout_row, children=[
+                        html.Span("b2-leg EV contribution"),
+                        html.Span(id="pnl2-out", style={"color": GREEN})]),
                 ]),
-                html.Div(style={"marginTop": "18px"}, children=[
+
+                html.Div(style={"marginTop": "16px"}, children=[
                     html.Div("SCALE → TOTAL PnL", style={"color": MUTED, "fontSize": "10px",
-                                                         "letterSpacing": "2px",
-                                                         "marginBottom": "6px"}),
-                    html.Div(style={"display": "flex", "gap": "10px",
-                                    "alignItems": "center", "flexWrap": "wrap",
-                                    "marginBottom": "8px"}, children=[
-                        html.Span("gardeners per reserve atom", style={"color": MUTED,
-                                                                        "fontSize": "11px"}),
-                        dcc.Input(id="n-per-atom", type="number", value=1, step=1, min=0,
-                                  style={"width": "70px", "background": BG, "color": TEXT,
-                                         "border": f"1px solid {MUTED}", "padding": "3px 6px",
-                                         "borderRadius": "3px", "fontFamily": FONT}),
-                    ]),
-                    html.Div(style={"display": "flex", "gap": "10px",
-                                    "alignItems": "center", "flexWrap": "wrap",
-                                    "marginBottom": "10px"}, children=[
-                        html.Span("items per gardener", style={"color": MUTED,
-                                                                "fontSize": "11px"}),
-                        dcc.Input(id="items-per", type="number", value=1, step=1, min=0,
-                                  style={"width": "70px", "background": BG, "color": TEXT,
-                                         "border": f"1px solid {MUTED}", "padding": "3px 6px",
-                                         "borderRadius": "3px", "fontFamily": FONT}),
-                    ]),
+                                                          "letterSpacing": "2px", "marginBottom": "6px"}),
+                    html.Div(style={"display": "flex", "gap": "10px", "alignItems": "center",
+                                    "flexWrap": "wrap", "marginBottom": "8px"}, children=[
+                        _lbl("gardeners per atom"), _inp("n-per-atom", 1)]),
+                    html.Div(style={"display": "flex", "gap": "10px", "alignItems": "center",
+                                    "flexWrap": "wrap", "marginBottom": "10px"}, children=[
+                        _lbl("items per gardener"), _inp("items-per", 1)]),
                     html.Div(style=readout_row, children=[
-                        html.Span("gardener count  (51 × n_per_atom)"),
-                        html.Span(id="ngard-out", style={"color": TEAL}),
-                    ]),
+                        html.Span("gardener count  (51 × n)"),
+                        html.Span(id="ngard-out", style={"color": TEAL})]),
                     html.Div(style=readout_row, children=[
-                        html.Span("total items  (× items_per)"),
-                        html.Span(id="nitems-out", style={"color": TEAL}),
-                    ]),
+                        html.Span("total items"),
+                        html.Span(id="nitems-out", style={"color": TEAL})]),
                     html.Div(style=readout_row, children=[
                         html.Span("TOTAL E[PnL]"),
                         html.Span(id="grand-out", style={"color": GOLD, "fontSize": "16px",
-                                                          "fontWeight": 700}),
-                    ]),
+                                                          "fontWeight": 700})]),
                 ]),
             ]),
         ]),
@@ -369,113 +473,225 @@ app.layout = html.Div(
 
 # ---- callbacks -------------------------------------------------------------
 
+
+@app.callback(
+    Output("alpha-row", "style"),
+    Input("method", "value"),
+)
+def toggle_alpha(method):
+    base = {"marginTop": "8px", "gap": "8px", "alignItems": "center"}
+    return {**base, "display": "flex"} if method == "cvar" else {**base, "display": "none"}
+
+
+@app.callback(
+    Output("alpha-label", "children"),
+    Input("alpha-slider", "value"),
+)
+def alpha_label(v):
+    return f"{int((v or 0.2) * 100)}%"
+
+
+@app.callback(
+    Output("a2-chart-wrapper", "style"),
+    Input("a2-mode", "value"),
+)
+def toggle_a2_chart(mode):
+    return {"display": "block"} if mode == "direct" else {"display": "none"}
+
+
+# b2 distribution -----------------------------------------------------------
+
 @app.callback(
     Output("pmf-store", "data"),
-    Output("distro", "figure", allow_duplicate=True),
+    Output("distro", "figure"),
+    Output("a2-pmf-store", "data", allow_duplicate=True),
+    Output("a2-distro", "figure", allow_duplicate=True),
     Input("btn-uniform", "n_clicks"),
-    Input("btn-bimodal", "n_clicks"),
-    Input("btn-point920", "n_clicks"),
-    Input("btn-point795", "n_clicks"),
     Input("btn-normal", "n_clicks"),
     Input("btn-clear", "n_clicks"),
     Input("distro", "relayoutData"),
     State("mu", "value"),
     State("sigma", "value"),
     State("pmf-store", "data"),
-    prevent_initial_call="initial_duplicate",
+    prevent_initial_call=True,
 )
-def update_pmf(_u, _b, _p920, _p795, _n, _c, relayout, mu, sigma, current):
+def update_b2_pmf(_u, _n, _c, relayout, mu, sigma, current):
     trig = ctx.triggered_id
     pmf = np.array(current) if current else uniform_pmf()
+
     if trig == "btn-uniform":
         pmf = uniform_pmf()
-    elif trig == "btn-bimodal":
-        pmf = bimodal_pmf()
-    elif trig == "btn-point920":
-        pmf = point_pmf(920)
-    elif trig == "btn-point795":
-        pmf = point_pmf(795)
     elif trig == "btn-normal":
         pmf = normal_pmf(float(mu or 795), float(sigma or 25))
     elif trig == "btn-clear":
-        pass  # keep pmf; just re-render fresh fig (shapes gone)
+        pass
     elif trig == "distro" and relayout:
-        # prefer newest drawn shape
         shapes = relayout.get("shapes")
         if shapes:
             for sh in reversed(shapes):
-                path = sh.get("path")
-                if path:
-                    new = path_to_pmf(path)
-                    if new is not None:
-                        pmf = new
-                        break
-        else:
-            # handle per-shape edits like shapes[0].path
-            path_keys = [k for k in relayout.keys() if k.endswith(".path")]
-            for k in path_keys:
-                new = path_to_pmf(relayout[k])
+                new = path_to_pmf(sh.get("path", ""))
                 if new is not None:
                     pmf = new
                     break
+        else:
+            for k in relayout:
+                if k.endswith(".path"):
+                    new = path_to_pmf(relayout[k])
+                    if new is not None:
+                        pmf = new
+                        break
             else:
-                return no_update, no_update
+                return no_update, no_update, no_update, no_update
     else:
-        return no_update, no_update
-    return pmf.tolist(), fig_distro(pmf)
+        return no_update, no_update, no_update, no_update
+
+    # always derive a2 prior as point mass at mean of b2 distro
+    a2_pmf = point_pmf(mean_of(pmf))
+    return pmf.tolist(), fig_b2_distro(pmf), a2_pmf.tolist(), fig_a2_distro(a2_pmf)
+
+
+# avg_b2 prior ---------------------------------------------------------------
+
+_A2_DIRECT_TRIGGERS = {
+    "btn-a2-nash", "btn-a2-level0", "btn-a2-uniform",
+    "btn-a2-normal", "btn-a2-beta", "btn-a2-clear", "a2-distro",
+}
 
 
 @app.callback(
-    Output("distro", "figure"),
-    Output("ev-curve", "figure"),
+    Output("a2-pmf-store", "data"),
+    Output("a2-distro", "figure"),
+    Output("pmf-store", "data", allow_duplicate=True),
+    Output("distro", "figure", allow_duplicate=True),
+    Input("btn-a2-nash", "n_clicks"),
+    Input("btn-a2-level0", "n_clicks"),
+    Input("btn-a2-uniform", "n_clicks"),
+    Input("btn-a2-normal", "n_clicks"),
+    Input("btn-a2-beta", "n_clicks"),
+    Input("btn-a2-clear", "n_clicks"),
+    Input("a2-distro", "relayoutData"),
+    Input("a2-mode", "value"),
+    Input("pmf-store", "data"),
+    State("mu-a2", "value"),
+    State("sigma-a2", "value"),
+    State("beta-a", "value"),
+    State("beta-b", "value"),
+    State("a2-pmf-store", "data"),
+    prevent_initial_call=True,
+)
+def update_a2_pmf(_nash, _l0, _uni, _norm, _beta_btn, _clr, relayout,
+                  mode, b2_pmf_data, mu_a2, sigma_a2, ba, bb, current):
+    trig = ctx.triggered_id
+    pmf = np.array(current) if current else _DEFAULT_A2_PMF.copy()
+
+    # Derived mode: always snap a2 prior to point at b2 distro mean
+    if mode == "derived":
+        b2_pmf = np.array(b2_pmf_data) if b2_pmf_data else uniform_pmf()
+        pmf = point_pmf(mean_of(b2_pmf))
+        return pmf.tolist(), fig_a2_distro(pmf), no_update, no_update
+
+    # Direct mode: respond to explicit a2 controls
+    clear_b2 = trig in _A2_DIRECT_TRIGGERS   # reset b2 distro when user works in a2 panel
+
+    if trig == "btn-a2-nash":
+        pmf = point_pmf(835)
+    elif trig == "btn-a2-level0":
+        pmf = point_pmf(795)
+    elif trig == "btn-a2-uniform":
+        pmf = uniform_pmf()
+    elif trig == "btn-a2-normal":
+        pmf = normal_pmf(float(mu_a2 or 840), float(sigma_a2 or 30))
+    elif trig == "btn-a2-beta":
+        pmf = beta_pmf(float(ba or 2), float(bb or 2))
+    elif trig == "btn-a2-clear":
+        pass
+    elif trig == "a2-distro" and relayout:
+        shapes = relayout.get("shapes")
+        found = False
+        if shapes:
+            for sh in reversed(shapes):
+                new = path_to_pmf(sh.get("path", ""))
+                if new is not None:
+                    pmf = new
+                    found = True
+                    break
+        else:
+            for k in relayout:
+                if k.endswith(".path"):
+                    new = path_to_pmf(relayout[k])
+                    if new is not None:
+                        pmf = new
+                        found = True
+                        break
+        if not found and not shapes:
+            # pure pan/zoom — no draw, don't clear either
+            return no_update, no_update, no_update, no_update
+    elif trig == "a2-mode":
+        if mode == "direct":
+            return no_update, no_update, uniform_pmf().tolist(), fig_b2_empty()
+        return no_update, no_update, no_update, no_update
+    elif trig == "pmf-store":
+        return no_update, no_update, no_update, no_update
+    else:
+        return no_update, no_update, no_update, no_update
+
+    b2_fig = fig_b2_empty() if clear_b2 else no_update
+    b2_data = uniform_pmf().tolist() if clear_b2 else no_update
+    return pmf.tolist(), fig_a2_distro(pmf), b2_data, b2_fig
+
+
+# main refresh — triggered only by a2-pmf-store and right-col inputs ---------
+
+@app.callback(
+    Output("sensitivity", "figure"),
     Output("b1-out", "children"),
     Output("b2-out", "children"),
     Output("ev-out", "children"),
+    Output("ev-label", "children"),
+    Output("method-label", "children"),
     Output("a2-out", "children"),
-    Output("mode-out", "children"),
+    Output("ev-point-out", "children"),
+    Output("pen-out", "children"),
     Output("p1-out", "children"),
     Output("p2-out", "children"),
     Output("p0-out", "children"),
-    Output("pen-out", "children"),
     Output("pnl1-out", "children"),
     Output("pnl2-out", "children"),
-    Output("total-out", "children"),
     Output("ngard-out", "children"),
     Output("nitems-out", "children"),
     Output("grand-out", "children"),
-    Input("pmf-store", "data"),
+    Input("a2-pmf-store", "data"),
+    Input("method", "value"),
+    Input("alpha-slider", "value"),
     Input("n-per-atom", "value"),
     Input("items-per", "value"),
 )
-def refresh(pmf_data, n_per_atom, items_per):
-    pmf = np.array(pmf_data) if pmf_data else uniform_pmf()
-    a2 = mean_of(pmf)
-    v_star, b1_star, b2_star = optimize(a2)
-    total, pnl1, pnl2, p1, p2, pen = ev(b1_star, b2_star, a2)
-    mode_x = int(GRID[int(np.argmax(pmf))])
+def refresh(a2_pmf_data, method, alpha, n_per_atom, items_per):
+    a2_pmf = np.array(a2_pmf_data) if a2_pmf_data else _DEFAULT_A2_PMF.copy()
+    alpha = float(alpha or 0.2)
+
+    obj_v, b1_star, b2_star, ev_point = optimize_robust(a2_pmf, method, alpha)
+
+    e_a2 = mean_of(a2_pmf)
+    _, pnl1, pnl2, p1, p2, pen = ev_scalar(b1_star, b2_star, e_a2)
+
     n_atom = float(n_per_atom or 0)
     n_item = float(items_per or 0)
     n_gard = 51 * n_atom
-    n_tot_items = n_gard * n_item
-    grand = total * n_tot_items
+    n_tot = n_gard * n_item
+    grand = ev_point * n_tot
+
+    ev_lbl = "EV @ E[avg]"
+    mth_lbl = ("— EXPECTED EV OPTIMAL —" if method == "expected"
+               else f"— CVaR α={int(alpha*100)}% OPTIMAL —")
+
     return (
-        fig_distro(pmf),
-        fig_ev_curve(pmf, b1_star, b2_star),
-        f"{b1_star}",
-        f"{b2_star}",
-        f"{v_star:,.1f}",
-        f"{a2:.2f}",
-        f"{mode_x}",
-        f"{p1*100:.1f}%",
-        f"{p2*100:.1f}%",
-        f"{(1-p1-p2)*100:.1f}%",
-        f"{pen:.3f}",
-        f"{pnl1:,.2f}",
-        f"{pnl2:,.2f}",
-        f"{total:,.2f}",
-        f"{n_gard:,.0f}",
-        f"{n_tot_items:,.0f}",
-        f"{grand:,.2f}",
+        fig_sensitivity(b1_star, b2_star, a2_pmf),
+        f"{b1_star}", f"{b2_star}", f"{ev_point:,.1f}",
+        ev_lbl, mth_lbl, f"{e_a2:.1f}", f"{obj_v:,.2f}", f"{pen:.3f}",
+        f"{p1*100:.1f}%", f"{p2*100:.1f}%", f"{(1-p1-p2)*100:.1f}%",
+        f"{pnl1:,.2f}", f"{pnl2:,.2f}",
+        f"{n_gard:,.0f}", f"{n_tot:,.0f}", f"{grand:,.2f}",
     )
 
 
