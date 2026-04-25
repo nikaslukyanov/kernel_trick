@@ -69,7 +69,7 @@ logger = Logger()
 
 ####### CONFIG #######
 
-POS_LIMIT  = 80
+POS_LIMIT  = 200
 
 PACK_SYMBOL  = "HYDROGEL_PACK"
 PACK_MEAN    = 9990
