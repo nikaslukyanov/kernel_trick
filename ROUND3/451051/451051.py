@@ -104,22 +104,18 @@ VOUCHER_QUOTE_SIZE = 7    # per-side size on each voucher quote — small or won
 
 REGRET_THRESHOLD = 1500   # TODO: tune — net portfolio delta threshold for throttle / lean denominator
 
+# Adaptive per-strike position cap, scaled linearly by |BS_delta|.
+# Deep ITM (delta≈1) → full O_LIMIT (let the printers print).
+# ATM (delta≈0.5) → ~150 (medium).
+# Far OTM (delta≈0.05) → tight cap (smile overshoots → don't load up).
+DELTA_CAP_MIN    = 50
+
 # Live smile fit (8-float EWMA state in traderData) — see options.ipynb live-engine test.
-# γ=0.999 → effective memory ~1000 ticks.
+# γ=0.999 → effective memory ~1000 ticks. Cold-starts from zero; converges in ~1k ticks.
 SMILE_GAMMA      = 0.999
-# Seed sums from training (rounds 0-2 of round 3). Replays all 30k ticks with γ=0.999.
-# These sums produce coeffs a≈9.62, b≈-0.065, c≈0.24 — end-of-training smile.
-# Engine starts hot — no warmup window. Old data still decays because EWMA keeps applying γ each tick.
-INITIAL_SMILE_SUMS = [
-    8.336818e+03,
-    -2.479861e+02,
-    8.282092e+01,
-    -7.868455e+00,
-    3.140089e+00,
-    2.807962e+03,
-    -1.404019e+02,
-    5.052927e+01,
-]
+SMILE_WARMUP_N   = 2000    # need this many accumulated obs before trusting fit
+# Pricing convention: F = wall_mid of underlying (current spot, market-consistent BS).
+# log_moneyness = ln(spot / K) — varies per tick as spot moves.
 
 ####### BLACK-SCHOLES HELPERS #######
 
@@ -329,6 +325,12 @@ class VoucherTrader(ProductTrader):
 
         fv = bs_call(self.spot, self.strike, T_EXPIRY, sigma)
 
+        # Adaptive per-strike position cap, scaled by |delta|.
+        # Far-OTM gets tight cap (smile overshoots → don't pin).
+        # Deep ITM gets full cap (delta≈1, mean-reverts cleanly).
+        delta_k    = bs_call_delta(self.spot, self.strike, T_EXPIRY, sigma)
+        strike_cap = max(DELTA_CAP_MIN, int(O_LIMIT * abs(delta_k)))
+
         inventory_lean = self.portfolio_delta / REGRET_THRESHOLD
         my_bid = fv - BASE_EDGE - inventory_lean * SPREAD
         my_ask = fv + BASE_EDGE - inventory_lean * SPREAD
@@ -336,6 +338,12 @@ class VoucherTrader(ProductTrader):
         # 4. THROTTLING — skip the offending side rather than posting useless 0 / 999999 orders
         post_bid = self.portfolio_delta <=  REGRET_THRESHOLD
         post_ask = self.portfolio_delta >= -REGRET_THRESHOLD
+
+        # Adaptive strike-cap gate
+        if self.initial_position >=  strike_cap:
+            post_bid = False
+        if self.initial_position <= -strike_cap:
+            post_ask = False
 
         if post_bid and my_bid > 0:
             self.bid(int(round(my_bid)), VOUCHER_QUOTE_SIZE)
@@ -444,7 +452,7 @@ class Trader:
             new_sums[5] += iv
             new_sums[6] += x * iv
             new_sums[7] += x * x * iv
-        coeffs = solve_smile(new_sums)
+        coeffs = solve_smile(new_sums) if new_sums[0] >= SMILE_WARMUP_N else None
         return new_sums, coeffs
 
     def _portfolio_delta(self, state: TradingState, smile_coeffs, spot) -> float:
@@ -482,8 +490,8 @@ class Trader:
         if spot is None:
             spot = trader_data.get("vev_wall_mid")
 
-        # Live smile fit — 8-float EWMA state. Cold-start from training-fitted sums.
-        smile_sums = trader_data.get("smile_sums", list(INITIAL_SMILE_SUMS))
+        # Live smile fit — 8-float EWMA state
+        smile_sums = trader_data.get("smile_sums", [0.0] * 8)
         smile_coeffs = None
         if spot is not None and spot > 0:
             smile_sums, smile_coeffs = self._update_smile(state, smile_sums, spot)
