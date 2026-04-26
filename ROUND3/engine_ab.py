@@ -79,8 +79,10 @@ MEAN  = ALPHA / (1.0 - BETA1 - BETA2)   # ≈ 5250.95
 # Symbols
 UNDERLYING      = "VELVETFRUIT_EXTRACT"
 VOUCHER_PREFIX  = "VEV_"
-# Trade only the two strikes with biggest detrended-IV residual stds (per options.ipynb): 5200, 5300
-VOUCHER_STRIKES = [5200, 5300]
+# All 10 vouchers feed the smile fit (more data points = stable parabola).
+ALL_STRIKES     = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
+# Only these two strikes get traded (largest residual std per options.ipynb).
+VOUCHER_STRIKES = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
 
 def voucher_symbol(strike: int) -> str:
     return f"{VOUCHER_PREFIX}{strike}"
@@ -90,25 +92,24 @@ U_LIMIT = 200    # VELVETFRUIT_EXTRACT
 O_LIMIT = 300    # per voucher
 
 # Engine A — underlying mean reversion (template_skew style around MEAN)
-VEV_STD       = 32      # TODO: fit std dev of VEV mid from historical data
+VEV_STD       = 15.630      # TODO: fit std dev of VEV mid from historical data
 SKEW_MAX      = 3       # TODO: tune — max ticks of price skew at 1σ from MEAN
 # SCALE_FACTOR from pseudocode is implicit in the size-scaling logic below.
 
 # Engine B — voucher market making
 T_EXPIRY  = 5.0 / 365.0   # TODO: held constant per user. 5 days till expiry. σ must match unit.
-BASE_EDGE = 2             # TODO: tune — half-spread around BS fair value
+BASE_EDGE = 1             # TODO: tune — half-spread around BS fair value
 SPREAD    = 4             # TODO: tune — magnitude of inventory-lean shift
-VOUCHER_QUOTE_SIZE = 6    # per-side size on each voucher quote — small or won't get filled
+VOUCHER_QUOTE_SIZE = 7    # per-side size on each voucher quote — small or won't get filled
 
 REGRET_THRESHOLD = 1500   # TODO: tune — net portfolio delta threshold for throttle / lean denominator
 
-# Per-strike implied vol. TODO: pull from options.ipynb smile fit (last day-2 parabola or rolling).
-# Day-2 parabola (from options.ipynb): a=9.6627, b=-0.0056, c=0.2478, log_mon = ln(MEAN/K).
-# Both K=5200 and K=5300 evaluate to ≈ 0.2487 → using that as placeholder.
-IV_TABLE = {
-    5200: 0.2487,
-    5300: 0.2487,
-}
+# Live smile fit (8-float EWMA state in traderData) — see options.ipynb live-engine test.
+# γ=0.999 → effective memory ~1000 ticks. Cold-starts from zero; converges in ~1k ticks.
+SMILE_GAMMA      = 0.999
+SMILE_WARMUP_N   = 200    # need this many accumulated obs before trusting fit
+# Pricing convention: F = wall_mid of underlying (current spot, market-consistent BS).
+# log_moneyness = ln(spot / K) — varies per tick as spot moves.
 
 ####### BLACK-SCHOLES HELPERS #######
 
@@ -128,6 +129,46 @@ def bs_call_delta(F: float, K: float, T: float, sigma: float) -> float:
         return 1.0 if F > K else 0.0
     d1 = (math.log(F / K) + 0.5 * sigma * sigma * T) / (sigma * math.sqrt(T))
     return norm_cdf(d1)
+
+def implied_vol(market_price: float, F: float, K: float, T: float,
+                lo: float = 1e-4, hi: float = 5.0, tol: float = 1e-5, max_iter: int = 50):
+    """Bisection IV solver. Returns None if no valid bracket."""
+    if T <= 0:
+        return None
+    intrinsic = max(F - K, 0.0)
+    if market_price <= intrinsic + 1e-6:
+        return None
+    f_lo = bs_call(F, K, T, lo) - market_price
+    f_hi = bs_call(F, K, T, hi) - market_price
+    if f_lo * f_hi > 0:
+        return None
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        f_mid = bs_call(F, K, T, mid) - market_price
+        if abs(f_mid) < tol:
+            return mid
+        if f_lo * f_mid < 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    return 0.5 * (lo + hi)
+
+def solve_smile(s):
+    """Cramer's rule on 3x3 normal equations. s = [Σ1, Σx, Σx², Σx³, Σx⁴, Σy, Σxy, Σx²y].
+    Returns (a, b, c) for IV ≈ a·x² + b·x + c, or None if singular."""
+    s0, s1, s2, s3, s4, y0, y1, y2 = s
+    # M = [[s0,s1,s2],[s1,s2,s3],[s2,s3,s4]],  rhs = [y0, y1, y2],  unknowns [c, b, a]
+    det = (s0*(s2*s4 - s3*s3) - s1*(s1*s4 - s3*s2) + s2*(s1*s3 - s2*s2))
+    if abs(det) < 1e-18:
+        return None
+    det_c = (y0*(s2*s4 - s3*s3) - s1*(y1*s4 - s3*y2) + s2*(y1*s3 - s2*y2))
+    det_b = (s0*(y1*s4 - s3*y2) - y0*(s1*s4 - s3*s2) + s2*(s1*y2 - y1*s2))
+    det_a = (s0*(s2*y2 - y1*s3) - s1*(s1*y2 - y1*s2) + y0*(s1*s3 - s2*s2))
+    return det_a/det, det_b/det, det_c/det
+
+def smile_iv(coeffs, log_mon: float) -> float:
+    a, b, c = coeffs
+    return a * log_mon * log_mon + b * log_mon + c
 
 ####### BASE TRADER #######
 
@@ -242,21 +283,29 @@ class VelvetTrader(ProductTrader):
 
 
 ####### ENGINE B — VOUCHER MARKET MAKING #######
-# FV = BS_call(F=MEAN, K=strike, T=T_EXPIRY, σ=IV_TABLE[strike])  — constant per tick.
+# FV = BS_call(F=spot, K=strike, T=T_EXPIRY, σ=smile_iv(K, spot))
+# Smile σ comes from the live EWMA parabola fit maintained in Trader.run.
 # Lean quotes against portfolio delta. Throttle = kill bid/ask side past threshold.
 class VoucherTrader(ProductTrader):
 
-    def __init__(self, state: TradingState, strike: int, portfolio_delta: float):
+    def __init__(self, state: TradingState, strike: int, portfolio_delta: float,
+                 smile_coeffs, spot: float):
         super().__init__(voucher_symbol(strike), state, O_LIMIT)
         self.strike          = strike
         self.portfolio_delta = portfolio_delta
+        self.smile_coeffs    = smile_coeffs    # (a, b, c) or None during warmup
+        self.spot            = spot
 
     def get_orders(self):
-        sigma = IV_TABLE.get(self.strike)
-        if sigma is None:
+        if self.smile_coeffs is None or self.spot is None or self.spot <= 0:
             return {self.name: self.orders}
 
-        fv = bs_call(MEAN, self.strike, T_EXPIRY, sigma)
+        log_mon = math.log(self.spot / self.strike)
+        sigma   = smile_iv(self.smile_coeffs, log_mon)
+        if sigma <= 0:
+            return {self.name: self.orders}
+
+        fv = bs_call(self.spot, self.strike, T_EXPIRY, sigma)
 
         inventory_lean = self.portfolio_delta / REGRET_THRESHOLD
         my_bid = fv - BASE_EDGE - inventory_lean * SPREAD
@@ -281,17 +330,49 @@ class Trader:
     def __init__(self):
         pass
 
-    def _portfolio_delta(self, state: TradingState) -> float:
+    def _voucher_mid(self, state: TradingState, strike: int):
+        od = state.order_depths.get(voucher_symbol(strike))
+        if od is None or not od.buy_orders or not od.sell_orders:
+            return None
+        return 0.5 * (max(od.buy_orders) + min(od.sell_orders))
+
+    def _update_smile(self, state: TradingState, smile_sums, spot: float):
+        """Decay state by γ, then add this tick's (log_mon, iv) contributions across all 10 strikes.
+        Returns updated sums + fitted coeffs (or None if pre-warmup / singular)."""
+        new_sums = [SMILE_GAMMA * s for s in smile_sums]
+        for k in ALL_STRIKES:
+            mid = self._voucher_mid(state, k)
+            if mid is None:
+                continue
+            iv = implied_vol(mid, spot, k, T_EXPIRY)
+            if iv is None or iv <= 0 or iv > 5:
+                continue
+            x = math.log(spot / k)
+            new_sums[0] += 1.0
+            new_sums[1] += x
+            new_sums[2] += x * x
+            new_sums[3] += x * x * x
+            new_sums[4] += x * x * x * x
+            new_sums[5] += iv
+            new_sums[6] += x * iv
+            new_sums[7] += x * x * iv
+        coeffs = solve_smile(new_sums) if new_sums[0] >= SMILE_WARMUP_N else None
+        return new_sums, coeffs
+
+    def _portfolio_delta(self, state: TradingState, smile_coeffs, spot) -> float:
         # Underlying contributes delta = position. Each voucher contributes pos × BS delta.
         delta = float(state.position.get(UNDERLYING, 0))
+        if smile_coeffs is None or spot is None or spot <= 0:
+            return delta
         for k in VOUCHER_STRIKES:
             pos = state.position.get(voucher_symbol(k), 0)
             if pos == 0:
                 continue
-            sigma = IV_TABLE.get(k)
-            if sigma is None:
+            log_mon = math.log(spot / k)
+            sigma = smile_iv(smile_coeffs, log_mon)
+            if sigma <= 0:
                 continue
-            delta += pos * bs_call_delta(MEAN, k, T_EXPIRY, sigma)
+            delta += pos * bs_call_delta(spot, k, T_EXPIRY, sigma)
         return delta
 
     def run(self, state: TradingState):
@@ -305,8 +386,23 @@ class Trader:
         if prev_mid is not None and prev_prev_mid is not None:
             s_next = BETA1 * prev_mid + BETA2 * prev_prev_mid + ALPHA
 
-        portfolio_delta = self._portfolio_delta(state)
-        logger.print(f"delta={portfolio_delta:.1f} mean={MEAN:.1f} s_next={s_next}")
+        # Determine spot from underlying order book (used for smile fit + Engine B FV)
+        u_od = state.order_depths.get(UNDERLYING)
+        spot = None
+        if u_od is not None and u_od.buy_orders and u_od.sell_orders:
+            spot = 0.5 * (max(u_od.buy_orders) + min(u_od.sell_orders))
+        if spot is None:
+            spot = trader_data.get("vev_wall_mid")
+
+        # Live smile fit — 8-float EWMA state
+        smile_sums = trader_data.get("smile_sums", [0.0] * 8)
+        smile_coeffs = None
+        if spot is not None and spot > 0:
+            smile_sums, smile_coeffs = self._update_smile(state, smile_sums, spot)
+        trader_data["smile_sums"] = smile_sums
+
+        portfolio_delta = self._portfolio_delta(state, smile_coeffs, spot)
+        logger.print(f"delta={portfolio_delta:.1f} spot={spot} smile={smile_coeffs} n={smile_sums[0]:.1f}")
 
         # Engine A
         try:
@@ -322,7 +418,7 @@ class Trader:
         # Engine B — one VoucherTrader per strike
         for k in VOUCHER_STRIKES:
             try:
-                vrt = VoucherTrader(state, k, portfolio_delta)
+                vrt = VoucherTrader(state, k, portfolio_delta, smile_coeffs, spot)
                 result.update(vrt.get_orders())
             except Exception as e:
                 logger.print(f"ERROR {voucher_symbol(k)}: {e}")
