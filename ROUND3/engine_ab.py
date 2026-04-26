@@ -81,6 +81,9 @@ UNDERLYING      = "VELVETFRUIT_EXTRACT"
 VOUCHER_PREFIX  = "VEV_"
 ALL_STRIKES     = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
 VOUCHER_STRIKES = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
+# Far-OTM "wide" strikes: book sits at bid=0/ask=1. Spread infinite (tick > price).
+# MM the 0/1 spread directly — never take, only post passive. Strike-cap (50) limits damage.
+WIDE_STRIKES    = [6000, 6500]
 
 def voucher_symbol(strike: int) -> str:
     return f"{VOUCHER_PREFIX}{strike}"
@@ -303,6 +306,15 @@ class VoucherTrader(ProductTrader):
         self.spot            = spot
 
     def get_orders(self):
+        # Wide-strike override: K=6000/6500 sit at bid=0/ask=1 in the book. Tick size = full spread.
+        # Just post at 0 and 1 — pure passive MM, no take. Sanity-check the book first;
+        # if the microstructure shifts (e.g. mid moves above 0.5), bail out.
+        if self.strike in WIDE_STRIKES:
+            if self.bid_wall == 0 and self.ask_wall == 1:
+                self.bid(0, VOUCHER_QUOTE_SIZE)
+                self.ask(1, VOUCHER_QUOTE_SIZE)
+            return {self.name: self.orders}
+
         if self.smile_coeffs is None or self.spot is None or self.spot <= 0:
             return {self.name: self.orders}
 
