@@ -92,8 +92,8 @@ U_LIMIT = 200    # VELVETFRUIT_EXTRACT
 O_LIMIT = 300    # per voucher
 
 # Engine A — underlying mean reversion (template_skew style around MEAN)
-VEV_STD       = 15.630      # TODO: fit std dev of VEV mid from historical data
-SKEW_MAX      = 3       # TODO: tune — max ticks of price skew at 1σ from MEAN
+VEV_STD       = 15.630   
+SKEW_MAX      = 3      # TODO: tune — max ticks of price skew at 1σ from MEAN
 # SCALE_FACTOR from pseudocode is implicit in the size-scaling logic below.
 
 # Engine B — voucher market making
@@ -104,10 +104,17 @@ VOUCHER_QUOTE_SIZE = 7    # per-side size on each voucher quote — small or won
 
 REGRET_THRESHOLD = 1500   # TODO: tune — net portfolio delta threshold for throttle / lean denominator
 
+# Adaptive per-strike position cap, scaled linearly by |BS_delta|.
+# Deep ITM (delta≈1) → full O_LIMIT (let the printers print).
+# ATM (delta≈0.5) → ~150 (medium).
+# Far OTM (delta≈0.05) → tight cap (smile overshoots → don't load up).
+# Floor stops cap from collapsing to 0.
+DELTA_CAP_MIN    = 50
+
 # Live smile fit (8-float EWMA state in traderData) — see options.ipynb live-engine test.
 # γ=0.999 → effective memory ~1000 ticks. Cold-starts from zero; converges in ~1k ticks.
 SMILE_GAMMA      = 0.999
-SMILE_WARMUP_N   = 200    # need this many accumulated obs before trusting fit
+SMILE_WARMUP_N   = 2000    # need this many accumulated obs before trusting fit
 # Pricing convention: F = wall_mid of underlying (current spot, market-consistent BS).
 # log_moneyness = ln(spot / K) — varies per tick as spot moves.
 
@@ -307,6 +314,12 @@ class VoucherTrader(ProductTrader):
 
         fv = bs_call(self.spot, self.strike, T_EXPIRY, sigma)
 
+        # Adaptive per-strike position cap, scaled by |delta|.
+        # Far-OTM gets tight cap (smile overshoots → don't pin).
+        # Deep ITM gets full cap (delta-1, mean-reverts cleanly).
+        delta_k = bs_call_delta(self.spot, self.strike, T_EXPIRY, sigma)
+        strike_cap = max(DELTA_CAP_MIN, int(O_LIMIT * abs(delta_k)))
+
         inventory_lean = self.portfolio_delta / REGRET_THRESHOLD
         my_bid = fv - BASE_EDGE - inventory_lean * SPREAD
         my_ask = fv + BASE_EDGE - inventory_lean * SPREAD
@@ -314,6 +327,12 @@ class VoucherTrader(ProductTrader):
         # 4. THROTTLING — skip the offending side rather than posting useless 0 / 999999 orders
         post_bid = self.portfolio_delta <=  REGRET_THRESHOLD
         post_ask = self.portfolio_delta >= -REGRET_THRESHOLD
+
+        # Adaptive strike-cap gate
+        if self.initial_position >=  strike_cap:
+            post_bid = False
+        if self.initial_position <= -strike_cap:
+            post_ask = False
 
         if post_bid and my_bid > 0:
             self.bid(int(round(my_bid)), VOUCHER_QUOTE_SIZE)
