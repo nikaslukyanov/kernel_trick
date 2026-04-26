@@ -77,10 +77,8 @@ BETA2 = 0.15759553490214856
 MEAN  = ALPHA / (1.0 - BETA1 - BETA2)   # ≈ 5250.95
 
 # Symbols
-UNDERLYING      = "VELVETFRUIT_EXTRACT"
-VOUCHER_PREFIX  = "VEV_"
-ALL_STRIKES     = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
-VOUCHER_STRIKES = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
+UNDERLYING     = "VELVETFRUIT_EXTRACT"
+VOUCHER_PREFIX = "VEV_"
 
 def voucher_symbol(strike: int) -> str:
     return f"{VOUCHER_PREFIX}{strike}"
@@ -91,28 +89,42 @@ O_LIMIT = 300    # per voucher
 
 # Engine A — underlying mean reversion (template_skew style around MEAN)
 VEV_STD       = 15.630
-SKEW_MAX      = 3       # TODO: tune — max ticks of price skew at 1σ from MEAN
+SKEW_MAX      = 3
 
-# Engine B — voucher market making
-T_EXPIRY  = 5.0 / 365.0   # TODO: held constant per user. 5 days till expiry. σ must match unit.
-BASE_EDGE = 1             # TODO: tune — half-spread around BS fair value
-SPREAD    = 4             # TODO: tune — magnitude of inventory-lean shift
-VOUCHER_QUOTE_SIZE = 7    # per-side size on each voucher quote — small or won't get filled
+####### VOUCHER STRATEGY (per discord: trevor + pirey) #######
+# Three groups, each with its own quote logic:
+#   SMILE_STRIKES  — fit a hardcoded polynomial smile from training (pirey).
+#                    Quote around BS fair value. Direction-gate by z-score residual.
+#   DELTA1_STRIKES — pure intrinsic, no time value. MM tight around wall_mid.
+#   WIDE_STRIKES   — bid=0, ask=1 in market. MM the 1-tick spread directly.
 
-REGRET_THRESHOLD = 1500   # TODO: tune — net portfolio delta threshold for throttle / lean denominator
+SMILE_STRIKES  = [5000, 5100, 5200, 5300, 5400, 5500]
+DELTA1_STRIKES = [4000, 4500]
+WIDE_STRIKES   = [6000, 6500]
+VOUCHER_STRIKES = SMILE_STRIKES + DELTA1_STRIKES + WIDE_STRIKES
 
-# Adaptive per-strike position cap, scaled linearly by |BS_delta|.
-# Deep ITM (delta≈1) → full O_LIMIT (let the printers print).
-# ATM (delta≈0.5) → ~150 (medium).
-# Far OTM (delta≈0.05) → tight cap (smile overshoots → don't load up).
-DELTA_CAP_MIN    = 50
+VOUCHER_QUOTE_SIZE = 7    # per rayray: 7 is the right limit
 
-# Live smile fit (8-float EWMA state in traderData) — see options.ipynb live-engine test.
-# γ=0.999 → effective memory ~1000 ticks. Cold-starts from zero; converges in ~1k ticks.
-SMILE_GAMMA      = 0.999
-SMILE_WARMUP_N   = 2000    # need this many accumulated obs before trusting fit
-# Pricing convention: F = wall_mid of underlying (current spot, market-consistent BS).
-# log_moneyness = ln(spot / K) — varies per tick as spot moves.
+# Hardcoded polynomial smile from pirey's training fit (K=5000–5500, daily-unit IV).
+# σ_daily(x) = SMILE_A · x² + SMILE_B · x + SMILE_C   where x = ln(spot/K)
+SMILE_A       = 0.086020
+SMILE_B       = -0.000806
+SMILE_C       = 0.012536
+T_EXPIRY_DAYS = 5.0   # 5 days; uses daily-unit σ from poly above
+
+# Per-strike chronic mispricing stats from training (market_mid - poly_FV).
+# (mean, std) — used to z-score the live deviation each tick.
+STRIKE_DEV_STATS = {
+    5000: (-0.05, 0.57),
+    5100: (-0.07, 0.92),
+    5200: (+0.72, 0.93),
+    5300: (+1.32, 1.16),
+    5400: (-2.19, 0.78),
+    5500: (+0.53, 0.44),
+}
+Z_GATE          = 1.0    # |z| threshold for one-sided quoting
+SMILE_BASE_EDGE = 1      # half-spread around poly FV
+DELTA1_EDGE     = 1      # half-spread around wall_mid for K=4000/4500
 
 ####### BLACK-SCHOLES HELPERS #######
 
@@ -173,12 +185,15 @@ def smile_iv(coeffs, log_mon: float) -> float:
     a, b, c = coeffs
     return a * log_mon * log_mon + b * log_mon + c
 
+def poly_iv(log_mon: float) -> float:
+    """Hardcoded smile from training. Returns σ in daily units (x = ln(spot/K))."""
+    return SMILE_A * log_mon * log_mon + SMILE_B * log_mon + SMILE_C
+
 ####### BASE TRADER #######
 
 class ProductTrader:
 
-    def __init__(self, symbol: str, state: TradingState, pos_limit: int,
-                 extra_buy_used: int = 0, extra_sell_used: int = 0):
+    def __init__(self, symbol: str, state: TradingState, pos_limit: int):
         self.name      = symbol
         self.pos_limit = pos_limit
         self.state     = state
@@ -190,8 +205,6 @@ class ProductTrader:
         self.orders      = []
         self.buy_volume  = 0
         self.sell_volume = 0
-        self.extra_buy_used  = extra_buy_used    # qty already promised by an upstream engine (e.g. arb)
-        self.extra_sell_used = extra_sell_used
 
         self.mkt_buy_orders  = {p: abs(v) for p, v in sorted(order_depth.buy_orders.items(),  reverse=True)} if order_depth.buy_orders  else {}
         self.mkt_sell_orders = {p: abs(v) for p, v in sorted(order_depth.sell_orders.items())}              if order_depth.sell_orders else {}
@@ -201,11 +214,11 @@ class ProductTrader:
 
     @property
     def max_allowed_buy_volume(self):
-        return self.pos_limit - self.initial_position - self.buy_volume - self.extra_buy_used
+        return self.pos_limit - self.initial_position - self.buy_volume
 
     @property
     def max_allowed_sell_volume(self):
-        return self.pos_limit + self.initial_position - self.sell_volume - self.extra_sell_used
+        return self.pos_limit + self.initial_position - self.sell_volume
 
     def bid(self, price, quantity, logging=False):
         fill_volume = min(quantity, self.max_allowed_buy_volume)
@@ -289,56 +302,68 @@ class VelvetTrader(ProductTrader):
 
 
 ####### ENGINE B — VOUCHER MARKET MAKING #######
-# FV = BS_call(F=spot, K=strike, T=T_EXPIRY, σ=smile_iv(K, spot))
-# Smile σ comes from the live EWMA parabola fit maintained in Trader.run.
-# Lean quotes against portfolio delta. Throttle = kill bid/ask side past threshold.
+# Three modes per strike group:
+#   SMILE_STRIKES  → poly FV + z-residual directional gate (per pirey/trevor)
+#   DELTA1_STRIKES → MM tight around wall_mid (no FV from poly — intrinsic only)
+#   WIDE_STRIKES   → bid 0 / ask 1 (capture the chronic 1-tick spread)
 class VoucherTrader(ProductTrader):
 
-    def __init__(self, state: TradingState, strike: int, portfolio_delta: float,
-                 smile_coeffs, spot: float):
+    def __init__(self, state: TradingState, strike: int, spot: float):
         super().__init__(voucher_symbol(strike), state, O_LIMIT)
-        self.strike          = strike
-        self.portfolio_delta = portfolio_delta
-        self.smile_coeffs    = smile_coeffs
-        self.spot            = spot
+        self.strike = strike
+        self.spot   = spot
 
     def get_orders(self):
-        if self.smile_coeffs is None or self.spot is None or self.spot <= 0:
+        if self.spot is None or self.spot <= 0 or self.wall_mid is None:
             return {self.name: self.orders}
+        K = self.strike
+        if K in WIDE_STRIKES:
+            self._mm_wide()
+        elif K in DELTA1_STRIKES:
+            self._mm_delta1()
+        elif K in SMILE_STRIKES:
+            self._mm_smile()
+        return {self.name: self.orders}
 
-        log_mon = math.log(self.spot / self.strike)
-        sigma   = smile_iv(self.smile_coeffs, log_mon)
+    def _mm_wide(self):
+        # Market is bid 0 / ask 1. Sit on both sides, collect 1 tick when crossed.
+        self.bid(0, VOUCHER_QUOTE_SIZE)
+        self.ask(1, VOUCHER_QUOTE_SIZE)
+
+    def _mm_delta1(self):
+        # Pure intrinsic, behaves like underlying. MM tight around wall_mid.
+        wall_mid = self.wall_mid
+        bid_p = int(round(wall_mid - DELTA1_EDGE))
+        ask_p = int(round(wall_mid + DELTA1_EDGE))
+        if bid_p > 0:
+            self.bid(bid_p, VOUCHER_QUOTE_SIZE)
+        self.ask(ask_p, VOUCHER_QUOTE_SIZE)
+
+    def _mm_smile(self):
+        K = self.strike
+        log_mon = math.log(self.spot / K)
+        sigma   = poly_iv(log_mon)
         if sigma <= 0:
-            return {self.name: self.orders}
+            return
+        fv = bs_call(self.spot, K, T_EXPIRY_DAYS, sigma)
 
-        fv = bs_call(self.spot, self.strike, T_EXPIRY, sigma)
+        mean_dev, std_dev = STRIKE_DEV_STATS.get(K, (0.0, 1.0))
+        dev = self.wall_mid - fv
+        z   = (dev - mean_dev) / std_dev if std_dev > 0 else 0.0
 
-        # Adaptive per-strike position cap, scaled by |delta|.
-        # Far-OTM gets tight cap (smile overshoots → don't pin).
-        # Deep ITM gets full cap (delta≈1, mean-reverts cleanly).
-        delta_k    = bs_call_delta(self.spot, self.strike, T_EXPIRY, sigma)
-        strike_cap = max(DELTA_CAP_MIN, int(O_LIMIT * abs(delta_k)))
+        my_bid = int(round(fv - SMILE_BASE_EDGE))
+        my_ask = int(round(fv + SMILE_BASE_EDGE))
 
-        inventory_lean = self.portfolio_delta / REGRET_THRESHOLD
-        my_bid = fv - BASE_EDGE - inventory_lean * SPREAD
-        my_ask = fv + BASE_EDGE - inventory_lean * SPREAD
-
-        # 4. THROTTLING — skip the offending side rather than posting useless 0 / 999999 orders
-        post_bid = self.portfolio_delta <=  REGRET_THRESHOLD
-        post_ask = self.portfolio_delta >= -REGRET_THRESHOLD
-
-        # Adaptive strike-cap gate
-        if self.initial_position >=  strike_cap:
-            post_bid = False
-        if self.initial_position <= -strike_cap:
-            post_ask = False
+        # Directional gate: market chronically rich → only sell. Cheap → only buy.
+        post_bid = True
+        post_ask = True
+        if   z >  Z_GATE: post_bid = False
+        elif z < -Z_GATE: post_ask = False
 
         if post_bid and my_bid > 0:
-            self.bid(int(round(my_bid)), VOUCHER_QUOTE_SIZE)
+            self.bid(my_bid, VOUCHER_QUOTE_SIZE)
         if post_ask:
-            self.ask(int(round(my_ask)), VOUCHER_QUOTE_SIZE)
-
-        return {self.name: self.orders}
+            self.ask(my_ask, VOUCHER_QUOTE_SIZE)
 
 
 ####### MAIN #######
@@ -354,123 +379,11 @@ class Trader:
             return None
         return 0.5 * (max(od.buy_orders) + min(od.sell_orders))
 
-    def _call_spread_arb(self, state: TradingState):
-        """Scan all strike pairs for call-spread bound violations:
-            0 ≤ Call(K_low) - Call(K_high) ≤ K_high - K_low
-        Violations = locked-profit arb. Returns (orders_dict, arb_used dict, n_arbs).
-        arb_used[k] = (buy_qty_used, sell_qty_used) consumed by arb on this tick."""
-        arb_orders: dict[Symbol, list[Order]] = {}
-        arb_used: dict[int, list[int]] = {k: [0, 0] for k in VOUCHER_STRIKES}   # [buy, sell]
-        n_arbs = 0
-        strikes = sorted(VOUCHER_STRIKES)
-
-        def remaining_buy(k):
-            pos = state.position.get(voucher_symbol(k), 0)
-            return O_LIMIT - pos - arb_used[k][0]
-
-        def remaining_sell(k):
-            pos = state.position.get(voucher_symbol(k), 0)
-            return O_LIMIT + pos - arb_used[k][1]
-
-        for i, ki in enumerate(strikes):
-            for kj in strikes[i + 1:]:
-                sym_lo = voucher_symbol(ki)
-                sym_hi = voucher_symbol(kj)
-                od_lo = state.order_depths.get(sym_lo)
-                od_hi = state.order_depths.get(sym_hi)
-                if od_lo is None or od_hi is None:
-                    continue
-                strike_diff = kj - ki
-
-                # Direction A: Call(K_low) too expensive vs Call(K_high)
-                # Bound: bid_lo - ask_hi ≤ strike_diff. Violation → sell low, buy high.
-                if od_lo.buy_orders and od_hi.sell_orders:
-                    bid_lo  = max(od_lo.buy_orders)
-                    ask_hi  = min(od_hi.sell_orders)
-                    edge    = bid_lo - ask_hi - strike_diff
-                    if edge > 0:
-                        bidq_lo = od_lo.buy_orders[bid_lo]
-                        askq_hi = -od_hi.sell_orders[ask_hi]
-                        qty = min(bidq_lo, askq_hi, remaining_sell(ki), remaining_buy(kj))
-                        if qty > 0:
-                            arb_orders.setdefault(sym_lo, []).append(Order(sym_lo, bid_lo, -qty))
-                            arb_orders.setdefault(sym_hi, []).append(Order(sym_hi, ask_hi,  qty))
-                            arb_used[ki][1] += qty
-                            arb_used[kj][0] += qty
-                            n_arbs += 1
-                            logger.print(f"ARB+ sell {sym_lo}@{bid_lo} buy {sym_hi}@{ask_hi} qty={qty} edge={edge:.1f}")
-
-                # Direction B: Call(K_high) priced above Call(K_low) — also a violation.
-                # Bound: bid_hi - ask_lo ≤ 0. Violation → buy low, sell high.
-                if od_lo.sell_orders and od_hi.buy_orders:
-                    ask_lo  = min(od_lo.sell_orders)
-                    bid_hi  = max(od_hi.buy_orders)
-                    edge    = bid_hi - ask_lo
-                    if edge > 0:
-                        askq_lo = -od_lo.sell_orders[ask_lo]
-                        bidq_hi = od_hi.buy_orders[bid_hi]
-                        qty = min(askq_lo, bidq_hi, remaining_buy(ki), remaining_sell(kj))
-                        if qty > 0:
-                            arb_orders.setdefault(sym_lo, []).append(Order(sym_lo, ask_lo,  qty))
-                            arb_orders.setdefault(sym_hi, []).append(Order(sym_hi, bid_hi, -qty))
-                            arb_used[ki][0] += qty
-                            arb_used[kj][1] += qty
-                            n_arbs += 1
-                            logger.print(f"ARB- buy {sym_lo}@{ask_lo} sell {sym_hi}@{bid_hi} qty={qty} edge={edge:.1f}")
-
-        return arb_orders, arb_used, n_arbs
-
-    def _update_smile(self, state: TradingState, smile_sums, spot: float):
-        """Decay state by γ, then add this tick's (log_mon, iv) contributions across all 10 strikes.
-        Returns updated sums + fitted coeffs (or None if pre-warmup / singular)."""
-        new_sums = [SMILE_GAMMA * s for s in smile_sums]
-        for k in ALL_STRIKES:
-            mid = self._voucher_mid(state, k)
-            if mid is None:
-                continue
-            iv = implied_vol(mid, spot, k, T_EXPIRY)
-            if iv is None or iv <= 0 or iv > 5:
-                continue
-            x = math.log(spot / k)
-            new_sums[0] += 1.0
-            new_sums[1] += x
-            new_sums[2] += x * x
-            new_sums[3] += x * x * x
-            new_sums[4] += x * x * x * x
-            new_sums[5] += iv
-            new_sums[6] += x * iv
-            new_sums[7] += x * x * iv
-        coeffs = solve_smile(new_sums) if new_sums[0] >= SMILE_WARMUP_N else None
-        return new_sums, coeffs
-
-    def _portfolio_delta(self, state: TradingState, smile_coeffs, spot) -> float:
-        # Underlying contributes delta = position. Each voucher contributes pos × BS delta.
-        delta = float(state.position.get(UNDERLYING, 0))
-        if smile_coeffs is None or spot is None or spot <= 0:
-            return delta
-        for k in VOUCHER_STRIKES:
-            pos = state.position.get(voucher_symbol(k), 0)
-            if pos == 0:
-                continue
-            log_mon = math.log(spot / k)
-            sigma = smile_iv(smile_coeffs, log_mon)
-            if sigma <= 0:
-                continue
-            delta += pos * bs_call_delta(spot, k, T_EXPIRY, sigma)
-        return delta
-
     def run(self, state: TradingState):
         result: dict[Symbol, list[Order]] = {}
         trader_data = json.loads(state.traderData) if state.traderData else {}
 
-        # AR(2) state for future scalping (S_next currently unused by either engine)
-        prev_mid      = trader_data.get("prev_mid")
-        prev_prev_mid = trader_data.get("prev_prev_mid")
-        s_next = None
-        if prev_mid is not None and prev_prev_mid is not None:
-            s_next = BETA1 * prev_mid + BETA2 * prev_prev_mid + ALPHA
-
-        # Determine spot from underlying order book (used for smile fit + Engine B FV)
+        # Spot = underlying wall_mid
         u_od = state.order_depths.get(UNDERLYING)
         spot = None
         if u_od is not None and u_od.buy_orders and u_od.sell_orders:
@@ -478,15 +391,7 @@ class Trader:
         if spot is None:
             spot = trader_data.get("vev_wall_mid")
 
-        # Live smile fit — 8-float EWMA state
-        smile_sums = trader_data.get("smile_sums", [0.0] * 8)
-        smile_coeffs = None
-        if spot is not None and spot > 0:
-            smile_sums, smile_coeffs = self._update_smile(state, smile_sums, spot)
-        trader_data["smile_sums"] = smile_sums
-
-        portfolio_delta = self._portfolio_delta(state, smile_coeffs, spot)
-        logger.print(f"delta={portfolio_delta:.1f} spot={spot} smile={smile_coeffs} n={smile_sums[0]:.1f}")
+        logger.print(f"spot={spot}")
 
         # Engine A
         try:
@@ -499,27 +404,11 @@ class Trader:
         except Exception as e:
             logger.print(f"ERROR {UNDERLYING}: {e}")
 
-        # Engine C — cross-strike call-spread arbitrage (locked profit when book violates bounds).
-        try:
-            arb_orders, arb_used, n_arbs = self._call_spread_arb(state)
-            for sym, orders in arb_orders.items():
-                result.setdefault(sym, []).extend(orders)
-            if n_arbs:
-                logger.print(f"arbs_fired={n_arbs}")
-        except Exception as e:
-            logger.print(f"ERROR arb: {e}")
-            arb_used = {k: [0, 0] for k in VOUCHER_STRIKES}
-
-        # Engine B — one VoucherTrader per strike (capacity reduced by arb's per-strike usage)
+        # Engine B — one VoucherTrader per strike (mode dispatched inside the class)
         for k in VOUCHER_STRIKES:
             try:
-                buy_used, sell_used = arb_used.get(k, (0, 0))
-                vrt = VoucherTrader(state, k, portfolio_delta, smile_coeffs, spot)
-                vrt.extra_buy_used  = buy_used
-                vrt.extra_sell_used = sell_used
-                voucher_orders = vrt.get_orders()
-                for sym, orders in voucher_orders.items():
-                    result.setdefault(sym, []).extend(orders)
+                vrt = VoucherTrader(state, k, spot)
+                result.update(vrt.get_orders())
             except Exception as e:
                 logger.print(f"ERROR {voucher_symbol(k)}: {e}")
 
