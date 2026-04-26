@@ -96,6 +96,13 @@ O_LIMIT = 300    # per voucher
 VEV_STD       = 15.630
 SKEW_MAX      = 3       # TODO: tune — max ticks of price skew at 1σ from MEAN
 
+# HYDROGEL_PACK — second mean-reverting product (from template_skew.py).
+PACK_SYMBOL   = "HYDROGEL_PACK"
+PACK_LIMIT    = 200
+PACK_MEAN     = 9990
+PACK_STD      = 32      # tune from historical data
+PACK_SKEW_MAX = 3       # max ticks of skew at 1σ away from PACK_MEAN
+
 # Engine B — voucher market making
 T_EXPIRY  = 5.0 / 365.0   # TODO: held constant per user. 5 days till expiry. σ must match unit.
 BASE_EDGE = 1             # TODO: tune — half-spread around BS fair value
@@ -282,6 +289,62 @@ class VelvetTrader(ProductTrader):
         ask_price = max(base_ask - skew, ask_floor)
 
         std_devs = (fair_value - MEAN) / VEV_STD
+        normalized = min(abs(std_devs) / 3, 1.0)
+        if std_devs > 0:
+            maker_buy_volume  = min(int(6 + (self.max_allowed_buy_volume  - 6) * normalized), self.max_allowed_buy_volume)
+            maker_sell_volume = min(6, self.max_allowed_sell_volume)
+        else:
+            maker_buy_volume  = min(6, self.max_allowed_buy_volume)
+            maker_sell_volume = min(int(6 + (self.max_allowed_sell_volume - 6) * normalized), self.max_allowed_sell_volume)
+
+        self.bid(bid_price, maker_buy_volume)
+        self.ask(ask_price, maker_sell_volume)
+        return {self.name: self.orders}
+
+
+####### ENGINE A2 — HYDROGEL_PACK MEAN REVERSION (from template_skew.py) #######
+# Same template_skew logic as VelvetTrader but anchored to PACK_MEAN (9990) with PACK_STD.
+class PACKTrader(ProductTrader):
+
+    def __init__(self, state: TradingState, last_wall_mid=None):
+        super().__init__(PACK_SYMBOL, state, PACK_LIMIT)
+        if self.wall_mid is None:
+            self.wall_mid = last_wall_mid
+
+    def get_orders(self):
+        if self.wall_mid is None:
+            return {self.name: self.orders}
+        fair_value = self.wall_mid
+
+        # 1. TAKING
+        for sell_price, sell_volume in self.mkt_sell_orders.items():
+            if sell_price <= fair_value - 1:
+                self.bid(sell_price, sell_volume)
+            elif sell_price <= fair_value and self.initial_position < 0:
+                self.bid(sell_price, min(sell_volume, abs(self.initial_position)))
+        for buy_price, buy_volume in self.mkt_buy_orders.items():
+            if buy_price >= fair_value + 1:
+                self.ask(buy_price, buy_volume)
+            elif buy_price >= fair_value and self.initial_position > 0:
+                self.ask(buy_price, min(buy_volume, self.initial_position))
+
+        # 2. MAKING — skew toward PACK_MEAN
+        bid_ceiling = int(fair_value) if self.position < 0 else int(fair_value - 1)
+        ask_floor   = int(fair_value) if self.position > 0 else int(fair_value + 1)
+
+        thick_bid = next((p for p in self.mkt_buy_orders  if p <= fair_value and self.mkt_buy_orders[p]  > 1), None)
+        thick_ask = next((p for p in self.mkt_sell_orders if p >= fair_value and self.mkt_sell_orders[p] > 1), None)
+
+        raw_skew = (fair_value - PACK_MEAN) / PACK_STD * PACK_SKEW_MAX
+        skew = int(round(max(-2 * PACK_SKEW_MAX, min(2 * PACK_SKEW_MAX, raw_skew))))
+
+        base_bid = (thick_bid + 1) if thick_bid is not None else int(fair_value - 6)
+        base_ask = (thick_ask - 1) if thick_ask is not None else int(fair_value + 6)
+
+        bid_price = min(base_bid - skew, bid_ceiling)
+        ask_price = max(base_ask - skew, ask_floor)
+
+        std_devs = (fair_value - PACK_MEAN) / PACK_STD
         normalized = min(abs(std_devs) / 3, 1.0)
         if std_devs > 0:
             maker_buy_volume  = min(int(6 + (self.max_allowed_buy_volume  - 6) * normalized), self.max_allowed_buy_volume)
@@ -492,7 +555,7 @@ class Trader:
         portfolio_delta = self._portfolio_delta(state, smile_coeffs, spot)
         logger.print(f"delta={portfolio_delta:.1f} spot={spot} smile={smile_coeffs} n={smile_sums[0]:.1f}")
 
-        # Engine A
+        # Engine A — VELVETFRUIT_EXTRACT
         try:
             vt = VelvetTrader(state, last_wall_mid=trader_data.get("vev_wall_mid"))
             result.update(vt.get_orders())
@@ -502,6 +565,15 @@ class Trader:
                 trader_data["vev_wall_mid"]  = vt.wall_mid
         except Exception as e:
             logger.print(f"ERROR {UNDERLYING}: {e}")
+
+        # Engine A2 — HYDROGEL_PACK (template_skew style)
+        try:
+            pt = PACKTrader(state, last_wall_mid=trader_data.get("pack_wall_mid"))
+            result.update(pt.get_orders())
+            if pt.wall_mid is not None:
+                trader_data["pack_wall_mid"] = pt.wall_mid
+        except Exception as e:
+            logger.print(f"ERROR {PACK_SYMBOL}: {e}")
 
         # Engine C — cross-strike call-spread arbitrage (locked profit when book violates bounds).
         try:
