@@ -13,6 +13,7 @@ Sign convention: positive qty = long, negative qty = short.
 """
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.stats import norm
 from mc_engine import (
     simulate_paths,
     call_payoff, put_payoff,
@@ -116,9 +117,18 @@ def simulate(positions, n_paths=DIST_PATHS, seed=0, plot=True, verbose=True):
         leg_table.append((name, qty, entry, payoff_per_unit.mean(),
                           leg_pnl.mean(), leg_pnl.std()))
 
+    mu = total_pnl.mean()
+    sd = total_pnl.std(ddof=1)
+    sd_score = sd / np.sqrt(SCORING_PATHS)
+    sharpe_score = mu / sd_score if sd_score > 0 else float("nan")
+    prob_score_pos = norm.cdf(sharpe_score) if sd_score > 0 else float("nan")
+
     summary = {
-        "mean_pnl": total_pnl.mean(),
-        "std_pnl":  total_pnl.std(),
+        "mean_pnl": mu,
+        "std_pnl":  sd,
+        "std_score": sd_score,
+        "sharpe_score": sharpe_score,
+        "prob_score_pos": prob_score_pos,
         "p05":      np.percentile(total_pnl, 5),
         "p50":      np.percentile(total_pnl, 50),
         "p95":      np.percentile(total_pnl, 95),
@@ -136,7 +146,13 @@ def simulate(positions, n_paths=DIST_PATHS, seed=0, plot=True, verbose=True):
                   f"{row[4]:>14.1f} {row[5]:>14.1f}")
         print("\n=== Total PnL distribution (over {} paths) ===".format(n_paths))
         for k, v in summary.items():
-            print(f"  {k:12s} = {v:>14.2f}" if isinstance(v, float) else f"  {k:12s} = {v}")
+            print(f"  {k:14s} = {v:>14.4f}" if isinstance(v, float) else f"  {k:14s} = {v}")
+
+        # paste-ready rounded position block
+        print("\n=== positions (rounded) ===")
+        for name, qty in positions.items():
+            if abs(qty) >= 0.5:
+                print(f"    '{name:10s}': {int(round(qty)):+5d},")
 
         # also report what the manual's own scoring criterion (avg PnL over 100 sims) gives
         score_paths = simulate_paths(SCORING_PATHS, n_steps=T2_STEPS, seed=seed + 1)
@@ -154,7 +170,7 @@ def simulate(positions, n_paths=DIST_PATHS, seed=0, plot=True, verbose=True):
         ax.axvline(summary["mean_pnl"], color="C1", lw=2, label=f"mean = {summary['mean_pnl']:.0f}")
         ax.axvline(summary["p05"], color="C3", ls="--", lw=1, label=f"5% = {summary['p05']:.0f}")
         ax.axvline(summary["p95"], color="C2", ls="--", lw=1, label=f"95% = {summary['p95']:.0f}")
-        ax.set(xlabel="PnL (seashells)", ylabel="paths",
+        ax.set(xlabel="terminal PnL per path", ylabel="paths",
                title="PnL distribution across simulated paths")
         ax.legend()
         plt.tight_layout()
@@ -165,17 +181,44 @@ def simulate(positions, n_paths=DIST_PATHS, seed=0, plot=True, verbose=True):
 
 
 if __name__ == "__main__":
-    # Demo: chooser arbitrage replication trade.
-    # If chooser_mid (22.25) < call_mid (12.025) + put14_mid (9.725) = 21.75,
-    # then sell replication, buy chooser.
-    # Actually 22.25 > 21.75 so chooser is RICH on mids -> short chooser, long the legs.
-    # But you trade at touch: buy 1 chooser at 22.30, sell 1 call+put at bids 12.00+9.70=21.70.
-    # Net debit 0.60 per unit -> bad. Reverse: short chooser at 22.20 bid, long call+put14
-    # at asks 12.05 + 9.75 = 21.80. Net credit 0.40 per unit. Risk-free if replication holds.
-    print(">>> Demo: chooser arb (short chooser, long replication)")
+
+
+    # seed 1 
+    # positions = {
+    #     'AC_50_P':   +12,
+    #     'AC_50_C':   +14,
+    #     'AC_35_P':   -35,
+    #     'AC_45_P':   +50,
+    #     'AC_50_P_2':    +9,
+    #     'AC_50_C_2':    +5,
+    #     'AC_50_CO':   -14,
+    #     'AC_40_BP':   -50,
+    # }
+    
+    # # seed 42
     positions = {
-        "AC_50_CO":  -50,   # short chooser at bid 22.20
-        "AC_50_C":   +50,   # long 21d call at ask 12.05
-        "AC_50_P_2": +50,   # long 14d put at ask 9.75
+        'AC_50_P':   +11,
+        'AC_50_C':   +14,
+        'AC_35_P':   -34,
+        'AC_45_P':   +50,
+        'AC_50_P_2':  +9,
+        'AC_50_C_2':    +5,
+        'AC_50_CO':   -14,
+        'AC_40_BP':   -50,
     }
-    simulate(positions, n_paths=20_000, seed=1)
+
+    # abd 
+    # positions = {
+    #     'AC_50_P':   0,
+    #     'AC_50_C':   0,
+    #     'AC_35_P':   0,
+    #     'AC_45_P':   0,
+    #     'AC_60_C': -50,
+    #     'AC_50_P_2':  50,
+    #     'AC_50_C_2':  50,
+    #     'AC_50_CO':   -50,
+    #     'AC_40_BP':   -50,
+    #     'AC_45_KO': -500
+    # }
+
+    simulate(positions, n_paths=1_000_000, seed=3)
