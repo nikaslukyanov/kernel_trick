@@ -134,7 +134,7 @@ VEV_TS_PER_TICK   = 100
 
 # Strike groups
 DEEP_ITM_STRIKES  = [4000, 4500]
-ACTIVE_STRIKES    = [5000, 5100, 5200, 5400, 5500]  # 5300 excluded (consistent bleeder)
+ACTIVE_STRIKES    = [5000, 5100, 5200, 5300, 5400, 5500]  # S3: include 5300
 DEEP_OTM_STRIKES  = [6000, 6500]
 
 # SSVI

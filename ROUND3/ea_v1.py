@@ -81,9 +81,6 @@ UNDERLYING      = "VELVETFRUIT_EXTRACT"
 VOUCHER_PREFIX  = "VEV_"
 ALL_STRIKES     = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
 VOUCHER_STRIKES = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
-# Far-OTM "wide" strikes: book sits at bid=0/ask=1. Spread infinite (tick > price).
-# MM the 0/1 spread directly — never take, only post passive. Strike-cap (50) limits damage.
-WIDE_STRIKES    = [6000, 6500]
 
 def voucher_symbol(strike: int) -> str:
     return f"{VOUCHER_PREFIX}{strike}"
@@ -95,35 +92,27 @@ O_LIMIT = 300    # per voucher
 # Engine A — underlying mean reversion (template_skew style around MEAN)
 VEV_STD       = 15.630
 SKEW_MAX      = 3       # TODO: tune — max ticks of price skew at 1σ from MEAN
-SPREAD_FRACTION = 0.6   # our quoted spread as a fraction of the market spread (50→30, 5→3)
-EMA_ALPHA       = 0.02  # ~50-tick EMA for spot z-score
-Z_TAKE_BUY      = 0.5   # only take buys if z-score < threshold (price not elevated vs history)
-Z_TAKE_SELL     = -0.5  # only take sells if z-score > threshold
 
 # Engine B — voucher market making
 T_EXPIRY  = 5.0 / 365.0   # TODO: held constant per user. 5 days till expiry. σ must match unit.
-BASE_EDGE = 1             # TODO: tune — half-spread around BS fair value (FV safety rail)
+BASE_EDGE = 1             # TODO: tune — half-spread around BS fair value
 SPREAD    = 4             # TODO: tune — magnitude of inventory-lean shift
 VOUCHER_QUOTE_SIZE = 7    # per-side size on each voucher quote — small or won't get filled
 
 REGRET_THRESHOLD = 1500   # TODO: tune — net portfolio delta threshold for throttle / lean denominator
 
+# Adaptive per-strike position cap, scaled linearly by |BS_delta|.
+# Deep ITM (delta≈1) → full O_LIMIT (let the printers print).
+# ATM (delta≈0.5) → ~150 (medium).
+# Far OTM (delta≈0.05) → tight cap (smile overshoots → don't load up).
+DELTA_CAP_MIN    = 50
+
 # Live smile fit (8-float EWMA state in traderData) — see options.ipynb live-engine test.
-# γ=0.999 → effective memory ~1000 ticks.
+# γ=0.999 → effective memory ~1000 ticks. Cold-starts from zero; converges in ~1k ticks.
 SMILE_GAMMA      = 0.999
-# Seed sums from training (rounds 0-2 of round 3). Replays all 30k ticks with γ=0.999.
-# These sums produce coeffs a≈9.62, b≈-0.065, c≈0.24 — end-of-training smile.
-# Engine starts hot — no warmup window. Old data still decays because EWMA keeps applying γ each tick.
-INITIAL_SMILE_SUMS = [
-    8.336818e+03,
-    -2.479861e+02,
-    8.282092e+01,
-    -7.868455e+00,
-    3.140089e+00,
-    2.807962e+03,
-    -1.404019e+02,
-    5.052927e+01,
-]
+SMILE_WARMUP_N   = 2000    # need this many accumulated obs before trusting fit
+# Pricing convention: F = wall_mid of underlying (current spot, market-consistent BS).
+# log_moneyness = ln(spot / K) — varies per tick as spot moves.
 
 ####### BLACK-SCHOLES HELPERS #######
 
@@ -247,32 +236,29 @@ class ProductTrader:
 # Below MEAN -> aggressive bid + inflated bid size. Above MEAN -> mirrored ask side.
 class VelvetTrader(ProductTrader):
 
-    def __init__(self, state: TradingState, last_wall_mid=None, vev_zscore: float = 0.0):
+    def __init__(self, state: TradingState, last_wall_mid=None):
         super().__init__(UNDERLYING, state, U_LIMIT)
         if self.wall_mid is None:
             self.wall_mid = last_wall_mid
-        self.vev_zscore = vev_zscore
 
     def get_orders(self):
         if self.wall_mid is None:
             return {self.name: self.orders}
         fair_value = self.wall_mid
 
-        # 1. TAKING — only when z-score confirms price is favorable vs recent history
-        if self.vev_zscore < Z_TAKE_BUY:
-            for sell_price, sell_volume in self.mkt_sell_orders.items():
-                if sell_price <= fair_value - 1:
-                    self.bid(sell_price, sell_volume)
-                elif sell_price <= fair_value and self.initial_position < 0:
-                    self.bid(sell_price, min(sell_volume, abs(self.initial_position)))
-        if self.vev_zscore > Z_TAKE_SELL:
-            for buy_price, buy_volume in self.mkt_buy_orders.items():
-                if buy_price >= fair_value + 1:
-                    self.ask(buy_price, buy_volume)
-                elif buy_price >= fair_value and self.initial_position > 0:
-                    self.ask(buy_price, min(buy_volume, self.initial_position))
+        # 1. TAKING
+        for sell_price, sell_volume in self.mkt_sell_orders.items():
+            if sell_price <= fair_value - 1:
+                self.bid(sell_price, sell_volume)
+            elif sell_price <= fair_value and self.initial_position < 0:
+                self.bid(sell_price, min(sell_volume, abs(self.initial_position)))
+        for buy_price, buy_volume in self.mkt_buy_orders.items():
+            if buy_price >= fair_value + 1:
+                self.ask(buy_price, buy_volume)
+            elif buy_price >= fair_value and self.initial_position > 0:
+                self.ask(buy_price, min(buy_volume, self.initial_position))
 
-        # 2. MAKING — 5c inside thick wall, skew toward MEAN
+        # 2. MAKING — skew toward MEAN
         bid_ceiling = int(fair_value) if self.position < 0 else int(fair_value - 1)
         ask_floor   = int(fair_value) if self.position > 0 else int(fair_value + 1)
 
@@ -282,19 +268,8 @@ class VelvetTrader(ProductTrader):
         raw_skew = (fair_value - MEAN) / VEV_STD * SKEW_MAX
         skew = int(round(max(-2 * SKEW_MAX, min(2 * SKEW_MAX, raw_skew))))
 
-        if thick_bid is not None and thick_ask is not None:
-            improve  = int((1 - SPREAD_FRACTION) / 2 * (thick_ask - thick_bid))
-            base_bid = thick_bid + improve
-            base_ask = thick_ask - improve
-        elif thick_bid is not None:
-            base_bid = thick_bid + 1
-            base_ask = int(fair_value + 2)
-        elif thick_ask is not None:
-            base_bid = int(fair_value - 2)
-            base_ask = thick_ask - 1
-        else:
-            base_bid = int(fair_value - 2)
-            base_ask = int(fair_value + 2)
+        base_bid = (thick_bid + 1) if thick_bid is not None else int(fair_value - 6)
+        base_ask = (thick_ask - 1) if thick_ask is not None else int(fair_value + 6)
 
         bid_price = min(base_bid - skew, bid_ceiling)
         ask_price = max(base_ask - skew, ask_floor)
@@ -328,15 +303,6 @@ class VoucherTrader(ProductTrader):
         self.spot            = spot
 
     def get_orders(self):
-        # Wide-strike override: K=6000/6500 sit at bid=0/ask=1 in the book. Tick size = full spread.
-        # Just post at 0 and 1 — pure passive MM, no take. Sanity-check the book first;
-        # if the microstructure shifts (e.g. mid moves above 0.5), bail out.
-        if self.strike in WIDE_STRIKES:
-            if self.bid_wall == 0 and self.ask_wall == 1:
-                self.bid(0, VOUCHER_QUOTE_SIZE)
-                self.ask(1, VOUCHER_QUOTE_SIZE)
-            return {self.name: self.orders}
-
         if self.smile_coeffs is None or self.spot is None or self.spot <= 0:
             return {self.name: self.orders}
 
@@ -347,22 +313,39 @@ class VoucherTrader(ProductTrader):
 
         fv = bs_call(self.spot, self.strike, T_EXPIRY, sigma)
 
-        inventory_lean = self.portfolio_delta / REGRET_THRESHOLD
+        # Adaptive per-strike position cap, scaled by |delta|.
+        # Far-OTM gets tight cap (smile overshoots → don't pin).
+        # Deep ITM gets full cap (delta≈1, mean-reverts cleanly).
+        delta_k    = bs_call_delta(self.spot, self.strike, T_EXPIRY, sigma)
+        strike_cap = max(DELTA_CAP_MIN, int(O_LIMIT * abs(delta_k)))
 
-        # Quote at SPREAD_FRACTION of market spread; FV ± BASE_EDGE is the safety rail
-        if self.bid_wall is not None and self.ask_wall is not None:
-            improve = (1 - SPREAD_FRACTION) / 2 * (self.ask_wall - self.bid_wall)
-            my_bid  = min(self.bid_wall + improve, fv - BASE_EDGE)
-            my_ask  = max(self.ask_wall - improve, fv + BASE_EDGE)
-        else:
-            my_bid = fv - BASE_EDGE
-            my_ask = fv + BASE_EDGE
-        my_bid -= inventory_lean * SPREAD
-        my_ask -= inventory_lean * SPREAD
+        inventory_lean = self.portfolio_delta / REGRET_THRESHOLD
+        my_bid = fv - BASE_EDGE - inventory_lean * SPREAD
+        my_ask = fv + BASE_EDGE - inventory_lean * SPREAD
+
+        # ea_v1: Taker leg — aggressively cross if clearly mispriced (>= BASE_EDGE edge)
+        if self.mkt_sell_orders:
+            best_ask_mkt = min(self.mkt_sell_orders)
+            if best_ask_mkt <= fv - BASE_EDGE and self.portfolio_delta <= REGRET_THRESHOLD:
+                take_qty = min(self.mkt_sell_orders[best_ask_mkt], self.max_allowed_buy_volume, VOUCHER_QUOTE_SIZE)
+                if take_qty > 0 and self.initial_position < strike_cap:
+                    self.bid(best_ask_mkt, take_qty)
+        if self.mkt_buy_orders:
+            best_bid_mkt = max(self.mkt_buy_orders)
+            if best_bid_mkt >= fv + BASE_EDGE and self.portfolio_delta >= -REGRET_THRESHOLD:
+                take_qty = min(self.mkt_buy_orders[best_bid_mkt], self.max_allowed_sell_volume, VOUCHER_QUOTE_SIZE)
+                if take_qty > 0 and self.initial_position > -strike_cap:
+                    self.ask(best_bid_mkt, take_qty)
 
         # 4. THROTTLING — skip the offending side rather than posting useless 0 / 999999 orders
         post_bid = self.portfolio_delta <=  REGRET_THRESHOLD
         post_ask = self.portfolio_delta >= -REGRET_THRESHOLD
+
+        # Adaptive strike-cap gate
+        if self.initial_position >=  strike_cap:
+            post_bid = False
+        if self.initial_position <= -strike_cap:
+            post_ask = False
 
         if post_bid and my_bid > 0:
             self.bid(int(round(my_bid)), VOUCHER_QUOTE_SIZE)
@@ -471,7 +454,7 @@ class Trader:
             new_sums[5] += iv
             new_sums[6] += x * iv
             new_sums[7] += x * x * iv
-        coeffs = solve_smile(new_sums)
+        coeffs = solve_smile(new_sums) if new_sums[0] >= SMILE_WARMUP_N else None
         return new_sums, coeffs
 
     def _portfolio_delta(self, state: TradingState, smile_coeffs, spot) -> float:
@@ -509,22 +492,8 @@ class Trader:
         if spot is None:
             spot = trader_data.get("vev_wall_mid")
 
-        # Spot EMA z-score — gates VelvetTrader taking to price-history-favorable moments
-        vev_ema     = trader_data.get("vev_ema")
-        vev_ema_var = trader_data.get("vev_ema_var", VEV_STD * VEV_STD)
-        if spot is not None:
-            if vev_ema is None:
-                vev_ema = spot
-            diff        = spot - vev_ema
-            vev_ema     = vev_ema + EMA_ALPHA * diff
-            vev_ema_var = (1 - EMA_ALPHA) * (vev_ema_var + EMA_ALPHA * diff * diff)
-            trader_data["vev_ema"]     = vev_ema
-            trader_data["vev_ema_var"] = vev_ema_var
-        ema_std    = math.sqrt(max(vev_ema_var, 1.0)) if vev_ema_var is not None else VEV_STD
-        vev_zscore = (spot - vev_ema) / ema_std if (spot is not None and vev_ema is not None) else 0.0
-
-        # Live smile fit — 8-float EWMA state. Cold-start from training-fitted sums.
-        smile_sums = trader_data.get("smile_sums", list(INITIAL_SMILE_SUMS))
+        # Live smile fit — 8-float EWMA state
+        smile_sums = trader_data.get("smile_sums", [0.0] * 8)
         smile_coeffs = None
         if spot is not None and spot > 0:
             smile_sums, smile_coeffs = self._update_smile(state, smile_sums, spot)
@@ -535,7 +504,7 @@ class Trader:
 
         # Engine A
         try:
-            vt = VelvetTrader(state, last_wall_mid=trader_data.get("vev_wall_mid"), vev_zscore=vev_zscore)
+            vt = VelvetTrader(state, last_wall_mid=trader_data.get("vev_wall_mid"))
             result.update(vt.get_orders())
             if vt.wall_mid is not None:
                 trader_data["prev_prev_mid"] = trader_data.get("prev_mid")

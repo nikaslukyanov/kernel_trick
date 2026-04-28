@@ -347,7 +347,7 @@ class VEVTrader:
         if VEV_POS_LIMIT - pos > 0:
             orders.append(Order(sym, 0, min(VEV_MAKER_SIZE, VEV_POS_LIMIT - pos)))
         if VEV_POS_LIMIT + pos > 0:
-            orders.append(Order(sym, 1, -min(VEV_MAKER_SIZE, VEV_POS_LIMIT + pos)))
+            orders.append(Order(sym, 2, -min(VEV_MAKER_SIZE, VEV_POS_LIMIT + pos)))  # S7: ask=2
         if orders:
             self._orders[sym] = orders
 

@@ -351,7 +351,66 @@ class VEVTrader:
         if orders:
             self._orders[sym] = orders
 
+    # ── S4: Cross-strike call spread no-arb ─────────────────────────────────
+
+    def _call_spread_arb(self):
+        ALL_STRIKES = DEEP_ITM_STRIKES + ACTIVE_STRIKES + DEEP_OTM_STRIKES
+        arb_used = {}  # track extra capacity used per strike
+
+        for i, K_lo in enumerate(ALL_STRIKES):
+            for K_hi in ALL_STRIKES[i+1:]:
+                sym_lo = f"VEV_{K_lo}"
+                sym_hi = f"VEV_{K_hi}"
+                d_lo = self.state.order_depths.get(sym_lo, OrderDepth())
+                d_hi = self.state.order_depths.get(sym_hi, OrderDepth())
+                if not d_lo.buy_orders or not d_lo.sell_orders:
+                    continue
+                if not d_hi.buy_orders or not d_hi.sell_orders:
+                    continue
+
+                bid_lo = max(d_lo.buy_orders)
+                ask_lo = min(d_lo.sell_orders)
+                bid_hi = max(d_hi.buy_orders)
+                ask_hi = min(d_hi.sell_orders)
+                strike_diff = K_hi - K_lo
+
+                # Direction A: C(K_lo) - C(K_hi) > strike_diff → impossible by no-arb
+                # sell K_lo at bid, buy K_hi at ask; profit = bid_lo - ask_hi - strike_diff
+                if bid_lo - ask_hi > strike_diff:
+                    pos_lo = self.state.position.get(sym_lo, 0)
+                    pos_hi = self.state.position.get(sym_hi, 0)
+                    used_sell_lo = arb_used.get(sym_lo + "_sell", 0)
+                    used_buy_hi  = arb_used.get(sym_hi + "_buy",  0)
+                    sell_cap = VEV_POS_LIMIT + pos_lo - used_sell_lo
+                    buy_cap  = VEV_POS_LIMIT - pos_hi - used_buy_hi
+                    qty = min(sell_cap, buy_cap, abs(d_lo.buy_orders[bid_lo]), abs(d_hi.sell_orders[ask_hi]))
+                    if qty > 0:
+                        self._orders.setdefault(sym_lo, []).append(Order(sym_lo, bid_lo, -qty))
+                        self._orders.setdefault(sym_hi, []).append(Order(sym_hi, ask_hi,  qty))
+                        arb_used[sym_lo + "_sell"] = used_sell_lo + qty
+                        arb_used[sym_hi + "_buy"]  = used_buy_hi  + qty
+
+                # Direction B: C(K_hi) - C(K_lo) < 0 → bid_hi > ask_lo
+                # buy K_lo at ask, sell K_hi at bid; profit = bid_hi - ask_lo > 0
+                elif bid_hi > ask_lo:
+                    pos_lo = self.state.position.get(sym_lo, 0)
+                    pos_hi = self.state.position.get(sym_hi, 0)
+                    used_buy_lo   = arb_used.get(sym_lo + "_buy",  0)
+                    used_sell_hi  = arb_used.get(sym_hi + "_sell", 0)
+                    buy_cap  = VEV_POS_LIMIT - pos_lo - used_buy_lo
+                    sell_cap = VEV_POS_LIMIT + pos_hi - used_sell_hi
+                    qty = min(buy_cap, sell_cap, abs(d_lo.sell_orders[ask_lo]), abs(d_hi.buy_orders[bid_hi]))
+                    if qty > 0:
+                        self._orders.setdefault(sym_lo, []).append(Order(sym_lo, ask_lo,  qty))
+                        self._orders.setdefault(sym_hi, []).append(Order(sym_hi, bid_hi, -qty))
+                        arb_used[sym_lo + "_buy"]  = used_buy_lo  + qty
+                        arb_used[sym_hi + "_sell"] = used_sell_hi + qty
+
     def get_orders(self):
+        try:
+            self._call_spread_arb()
+        except Exception as e:
+            logger.print(f"arb err: {e}")
         for K in DEEP_ITM_STRIKES:
             try:
                 self._trade_deep_itm(K)

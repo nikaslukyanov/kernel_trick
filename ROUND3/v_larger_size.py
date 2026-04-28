@@ -149,7 +149,7 @@ VEV_TAKE_THRESH   = 5.0   # only cross for extreme mispricing (5+ ticks); normal
 VEV_IV_LEAN       = 1.0   # shift both quotes by full price deviation toward our edge
 VEV_GAMMA_OPT     = 0.05  # per-option inventory skew (ticks/unit)
 VEV_GAMMA_DELTA   = 0.01  # base-delta skew
-VEV_MAKER_SIZE    = 7
+VEV_MAKER_SIZE    = 15  # S6: larger quotes
 
 # Deep ITM params
 DITM_TAKE_THRESH  = 2.0   # only take clear arb on deep ITM (2+ ticks)

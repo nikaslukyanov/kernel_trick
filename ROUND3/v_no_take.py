@@ -145,14 +145,14 @@ VEV_THETA_EWM     = 0.90
 # IV deviations from SSVI are slow-moving/persistent — no need to rush with takers.
 # Pure patient market making: earn the spread by quoting both sides competitively,
 # let the market come to us, use IV lean to accumulate naturally in the right direction.
-VEV_TAKE_THRESH   = 5.0   # only cross for extreme mispricing (5+ ticks); normally 0 taking
+VEV_TAKE_THRESH   = 9999  # S2: no taking — pure maker
 VEV_IV_LEAN       = 1.0   # shift both quotes by full price deviation toward our edge
 VEV_GAMMA_OPT     = 0.05  # per-option inventory skew (ticks/unit)
 VEV_GAMMA_DELTA   = 0.01  # base-delta skew
 VEV_MAKER_SIZE    = 7
 
 # Deep ITM params
-DITM_TAKE_THRESH  = 2.0   # only take clear arb on deep ITM (2+ ticks)
+DITM_TAKE_THRESH  = 9999  # S2: no taking anywhere
 DITM_GAMMA        = 0.05  # inventory skew for deep ITM
 
 ####### VEV OPTIONS TRADER #######

@@ -127,6 +127,10 @@ PACK_MEAN      = 9990
 PACK_STD       = 32
 SKEW_MAX       = 3
 
+# S5: delta hedge config
+UND_POS_LIMIT  = 200
+DELTA_THRESH   = 10   # hedge when net delta exceeds this (in underlying-equivalent units)
+
 UNDERLYING_SYMBOL = "VELVETFRUIT_EXTRACT"
 VEV_POS_LIMIT     = 100
 VEV_EXPIRY_TS     = 8_000_000
@@ -384,16 +388,33 @@ class Trader:
             vev_orders, new_theta = vev_trader.get_orders()
             result.update(vev_orders)
             trader_data["vev_theta"] = new_theta
-            logger.print(f"VEV Δ:{vev_trader.base_delta:.1f} θ:{new_theta:.6f}")
+            net_delta = vev_trader.base_delta
+            logger.print(f"VEV Δ:{net_delta:.1f} θ:{new_theta:.6f}")
         except Exception as e:
             logger.print(f"ERROR VEV: {e}")
+            net_delta = 0.0
 
-        # PACK: add back after VEV is tuned
-        # try:
-        #     pack_trader = PACKTrader(state, ...)
-        #     result.update(pack_trader.get_orders())
-        # except Exception as e:
-        #     logger.print(f"ERROR PACK: {e}")
+        # S5: delta hedge — trade underlying to flatten net option delta
+        try:
+            und_depth = state.order_depths.get(UNDERLYING_SYMBOL, OrderDepth())
+            und_pos   = state.position.get(UNDERLYING_SYMBOL, 0)
+            hedge_orders = []
+            if und_depth.sell_orders and net_delta < -DELTA_THRESH:
+                # net short delta → buy underlying
+                want = min(int(-net_delta - DELTA_THRESH), UND_POS_LIMIT - und_pos)
+                ask  = min(und_depth.sell_orders)
+                if want > 0:
+                    hedge_orders.append(Order(UNDERLYING_SYMBOL, ask, want))
+            elif und_depth.buy_orders and net_delta > DELTA_THRESH:
+                # net long delta → sell underlying
+                want = min(int(net_delta - DELTA_THRESH), UND_POS_LIMIT + und_pos)
+                bid  = max(und_depth.buy_orders)
+                if want > 0:
+                    hedge_orders.append(Order(UNDERLYING_SYMBOL, bid, -want))
+            if hedge_orders:
+                result[UNDERLYING_SYMBOL] = hedge_orders
+        except Exception as e:
+            logger.print(f"ERROR HEDGE: {e}")
 
         out = json.dumps(trader_data)
         logger.flush(state, result, 0, out)
