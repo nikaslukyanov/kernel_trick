@@ -5,7 +5,7 @@ path-dependent state that vanilla payoffs do not see.
 """
 import numpy as np
 import matplotlib.pyplot as plt
-from mc_engine import (
+from ROUND4.manual.mc_engine import (
     simulate_paths, S0, SIGMA, DT, T1_STEPS, T2_STEPS,
     call_payoff, put_payoff,
     binary_put_payoff, knockout_put_payoff, chooser_payoff,

@@ -27,7 +27,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 from scipy.stats import norm
-from mc_engine import (
+from ROUND4.manual.mc_engine import (
     simulate_paths, T1_STEPS, T2_STEPS, S0, SIGMA, DT,
     call_payoff, put_payoff,
     binary_put_payoff, knockout_put_payoff, chooser_payoff,
