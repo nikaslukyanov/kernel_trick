@@ -14,9 +14,14 @@ STEPS_PER_DAY = 4
 DAYS_PER_YEAR = 252
 DT = 1.0 / (DAYS_PER_YEAR * STEPS_PER_DAY)  # year fraction per tick
 
-T1_DAYS, T2_DAYS = 14, 21                   # 2wk, 3wk expiries (also chooser decision = 14d)
-T1_STEPS = T1_DAYS * STEPS_PER_DAY          # 56 ticks
-T2_STEPS = T2_DAYS * STEPS_PER_DAY          # 84 ticks
+# Manual quotes 14 / 21 *Solvinarian* (calendar) days. A "week" = 5 trading days
+# (mod confirmation), so 2/3 weeks = 10/15 trading days, NOT 14/21.
+# DT is per-trading-tick, so steps must use trading-day count.
+TRADING_DAYS_PER_WEEK = 5
+T1_DAYS = 2 * TRADING_DAYS_PER_WEEK         # 10 trading days (2 weeks / chooser decision)
+T2_DAYS = 3 * TRADING_DAYS_PER_WEEK         # 15 trading days (3 weeks / final expiry)
+T1_STEPS = T1_DAYS * STEPS_PER_DAY          # 40 ticks
+T2_STEPS = T2_DAYS * STEPS_PER_DAY          # 60 ticks
 
 
 def simulate_paths(n_paths, n_steps=T2_STEPS, s0=S0, sigma=SIGMA, dt=DT, seed=None):

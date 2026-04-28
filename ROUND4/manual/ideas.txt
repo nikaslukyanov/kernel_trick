@@ -1,0 +1,19 @@
+  1. Pure linear (max EV)                                                                                                                                                                 
+  
+  max E[PnL] s.t. caps. No variance term. Optimum = cap-saturate every +EV leg. Use this when you trust E[PnL] estimates and the leaderboard rewards mean.                                
+           
+  2. CVaR-penalized (downside-only)                                                                                                                                                       
+           
+  max E[PnL] - lam * CVaR_α[PnL] where CVaR_α = -E[PnL | PnL ≤ VaR_α]. Penalizes left tail only. KO long stops being punished for skew.                                                   
+  
+  3. Semi-variance (downside-variance)                                                                                                                                                    
+           
+  max E - 0.5 * lam * Var⁻[PnL] where Var⁻ = E[(PnL - μ)² · 1{PnL<μ}]. Same idea as CVaR but smoother to optimize.                                                                        
+  
+  4. Probabilistic constraint                                                                                                                                                             
+           
+  max E[PnL] s.t. P(score < threshold) ≤ p. Direct. Threshold = 0 or some negative bound.                                                                                                 
+           
+  5. Log/CRRA utility                                                                                                                                                                     
+           
+  max E[log(W + PnL)]. Auto-penalizes ruin. Need W. Equivalent to Kelly. Will reduce KO long sharply since W tail near zero.            
