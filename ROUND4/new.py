@@ -94,24 +94,9 @@ LIMIT = {HYDRO: 200, VELVET: 200}
 for _strike in STRIKES:
     LIMIT[OPTION_BY_STRIKE[_strike]] = 300
 
-USE_IV_OVERLAY = False
 ENABLE_OPTIONS = True
-ENABLE_BETA_LAYER = False
-ENABLE_OPTION_PASSIVE_BETA = True
 CP_DECAY = 0.90
 ANCHOR = {HYDRO: 9990.95, VELVET: 5250.71}
-
-# Compact fit from the Round 4 price series: options as extensions of VELVET.
-BETA_FIT = {
-    4000: (-4001.3, 1.000),
-    4500: (-4499.8, 1.000),
-    5000: (-4800.7, 0.963),
-    5100: (-4435.5, 0.876),
-    5200: (-3509.2, 0.686),
-    5300: (-2214.9, 0.430),
-    5400: (-926.4, 0.179),
-    5500: (-414.0, 0.080),
-}
 
 LOSER_BUYERS = {
     HYDRO: {"Mark 38"},
@@ -244,6 +229,7 @@ class Trader:
         else:
             fair = mid + 0.16 * (anchor - mid) - 0.12 * momentum + clamp((buy_flow - sell_flow) / 12.0, -2.0, 2.0)
             memory["velvet_edge"] = round(fair - mid, 4)
+            memory["velvet_z"] = round(float(z), 4)
             quote_size = 10
         pos = state.position.get(symbol, 0)
         orders: list[Order] = []
@@ -285,10 +271,34 @@ class Trader:
         d2 = d1 - vol
         return spot * self.norm_cdf(d1) - strike * self.norm_cdf(d2)
 
+    def bs_delta(self, spot: float, strike: int, t: float, sigma: float = 0.22) -> float:
+        if t <= 0 or sigma <= 0:
+            return 1.0 if spot >= strike else 0.0
+        vol = sigma * math.sqrt(t)
+        d1 = (math.log(max(spot, 1e-9) / strike) + 0.5 * sigma * sigma * t) / vol
+        return self.norm_cdf(d1)
+
+    def avellaneda_stoikov(self, mid: float, pos: int, sigma: float, gamma: float = 0.002, kappa: float = 1.5) -> tuple[float, float]:
+        sigma = max(sigma, 0.5)
+        reservation = mid - pos * gamma * sigma * sigma
+        half_spread = (gamma * sigma * sigma + (2.0 / gamma) * math.log(1.0 + gamma / kappa)) / 2.0
+        half_spread = max(half_spread, 1.0)
+        return reservation - half_spread, reservation + half_spread
+
     def trade_options(self, state: TradingState, memory: dict[str, Any], spot: float | None) -> dict[str, list[Order]]:
         result: dict[str, list[Order]] = {}
         if spot is None or not ENABLE_OPTIONS:
             return result
+
+        velvet_edge = float(memory.get("velvet_edge", 0.0))
+        velvet_z = float(memory.get("velvet_z", 0.0))
+        t = max(0.2, 4.0 - state.timestamp / 1_000_000.0) / 365.0
+
+        SIGNAL_Z = 1.5   # velvet z-score threshold for directional mode
+        AS_GAMMA = 0.002
+        AS_KAPPA = 1.5
+        DIR_CAP = 150
+        MM_CAP = 80
 
         for strike in STRIKES:
             symbol = OPTION_BY_STRIKE[strike]
@@ -304,91 +314,67 @@ class Trader:
 
             orders: list[Order] = []
             pending = 0
-            buy_flow, sell_flow = self.flow(memory, symbol)
             pos = state.position.get(symbol, 0)
             spread = ask - bid
+            buy_flow, sell_flow = self.flow(memory, symbol)
 
-            if ENABLE_BETA_LAYER and strike in BETA_FIT:
-                alpha, beta = BETA_FIT[strike]
-                fair = alpha + beta * spot
-                resid = mid - fair
-                z, _, std, hist_len = rolling_z(memory, "hist", f"{symbol}:beta", resid, 180, 45)
+            # Option fair value = mid + delta * velvet_edge
+            # Same mean-reversion signal as VELVET, scaled by delta.
+            delta = self.bs_delta(spot, strike, t)
+            fair = mid + delta * velvet_edge
+            base_edge = max(delta * 1.4, 1.0)
+            quote_size = max(2, int(delta * 10))
 
-                if USE_IV_OVERLAY and strike >= 5000:
-                    t = max(0.2, 4.0 - state.timestamp / 1_000_000.0) / 365.0
-                    iv_fair = self.bs_call(spot, strike, t, 0.22)
-                    iv_z, _, _, _ = rolling_z(memory, "hist", f"{symbol}:iv", mid - iv_fair, 180, 45)
-                    z = clamp(0.75 * z + 0.25 * iv_z, -4.0, 4.0)
-
-                velvet_edge = float(memory.get("velvet_edge", 0.0))
-                if USE_IV_OVERLAY:
-                    velvet_edge -= 0.20 * z
-                entry = 0.85 if strike <= 5200 else 1.25
-                cap = 170 if strike <= 5200 else 90
-                if hist_len >= 20 and abs(velvet_edge) > entry:
-                    target = int(round(clamp(velvet_edge * beta * 42.0, -cap, cap)))
-                    diff = target - (pos + pending)
-                    if diff > 0 and room_to_buy(state, symbol, pending) > 0:
-                        qty = min(diff, abs(depth.sell_orders[ask]), room_to_buy(state, symbol, pending), 12)
+            if abs(velvet_z) >= SIGNAL_Z:
+                # Directional: mirrors trade_mean_reverter, scaled by delta
+                max_qty = 15
+                if ask <= fair - base_edge and room_to_buy(state, symbol, pending) > 0 and pos + pending < DIR_CAP:
+                    qty = min(abs(depth.sell_orders[ask]), room_to_buy(state, symbol, pending), max_qty, DIR_CAP - pos - pending)
+                    if qty > 0:
                         orders.append(Order(symbol, ask, qty))
                         pending += qty
-                    elif diff < 0 and room_to_sell(state, symbol, pending) > 0:
-                        qty = min(-diff, abs(depth.buy_orders[bid]), room_to_sell(state, symbol, pending), 12)
+                if bid >= fair + base_edge and room_to_sell(state, symbol, pending) > 0 and pos + pending > -DIR_CAP:
+                    qty = min(abs(depth.buy_orders[bid]), room_to_sell(state, symbol, pending), max_qty, DIR_CAP + pos + pending)
+                    if qty > 0:
                         orders.append(Order(symbol, bid, -qty))
                         pending -= qty
 
-                if hist_len >= 20 and abs(velvet_edge) > entry * 0.7:
-                    if velvet_edge > 0 and room_to_buy(state, symbol, pending) > 0:
+                # Passive follow-up inside spread, inventory-adjusted
+                if spread >= 2 and abs(pos + pending) < DIR_CAP * 0.9:
+                    if mid < fair - 1.0 and room_to_buy(state, symbol, pending) > 0:
                         price = min(bid + 1, ask - 1)
                         if price < ask:
-                            qty = min(room_to_buy(state, symbol, pending), 8)
-                            orders.append(Order(symbol, price, qty))
-                            pending += qty
-                    elif velvet_edge < 0 and room_to_sell(state, symbol, pending) > 0:
+                            qty = min(room_to_buy(state, symbol, pending), max(2, quote_size - max(0, pos) // 15))
+                            if qty > 0:
+                                orders.append(Order(symbol, price, qty))
+                                pending += qty
+                    elif mid > fair + 1.0 and room_to_sell(state, symbol, pending) > 0:
                         price = max(ask - 1, bid + 1)
                         if price > bid:
-                            qty = min(room_to_sell(state, symbol, pending), 8)
-                            orders.append(Order(symbol, price, -qty))
-                            pending -= qty
-
-            if ENABLE_OPTION_PASSIVE_BETA and strike in BETA_FIT and spread >= 2:
-                alpha, beta = BETA_FIT[strike]
-                fair = alpha + beta * spot
-                resid = mid - fair
-                z, _, _, hist_len = rolling_z(memory, "hist", f"{symbol}:passive_beta", resid, 180, 30)
-                if USE_IV_OVERLAY and strike >= 5000:
-                    t = max(0.2, 4.0 - state.timestamp / 1_000_000.0) / 365.0
-                    iv_fair = self.bs_call(spot, strike, t, 0.22)
-                    iv_z, _, _, _ = rolling_z(memory, "hist", f"{symbol}:passive_iv", mid - iv_fair, 180, 30)
-                    z = clamp(0.8 * z + 0.2 * iv_z, -4.0, 4.0)
-
-                base_qty = 2 if strike in {4000, 4500} else 2
-                if strike in {5300, 5400, 5500}:
-                    base_qty = 4
-                cap = 80 if strike <= 5200 else 60
-                bid_price = min(bid + 1, ask - 1)
-                ask_price = max(ask - 1, bid + 1)
-
-                # Quote with the beta fair. We improve the touch by one tick so the
-                # synthetic trader flow can choose us ahead of the visible queue.
-                allow_bid = strike <= 5100 or (strike == 5200 and z < -2.0)
-                if allow_bid and bid_price < ask and pos + pending < cap and room_to_buy(state, symbol, pending) > 0:
-                    if fair >= bid_price + 0.6 and (z < 0.8 or hist_len < 30):
-                        qty = min(base_qty, room_to_buy(state, symbol, pending), cap - (pos + pending))
+                            qty = min(room_to_sell(state, symbol, pending), max(2, quote_size + min(0, pos) // 15))
+                            if qty > 0:
+                                orders.append(Order(symbol, price, -qty))
+                                pending -= qty
+            else:
+                # Avellaneda-Stoikov market making when no spot signal.
+                _, _, sigma_hist, _ = rolling_z(memory, "hist", f"{symbol}:mm", mid, 200, 40)
+                as_bid_f, as_ask_f = self.avellaneda_stoikov(mid, pos + pending, sigma_hist, AS_GAMMA, AS_KAPPA)
+                bid_price = min(int(math.floor(as_bid_f)), ask - 1)
+                ask_price = max(int(math.ceil(as_ask_f)), bid + 1)
+                if bid_price < ask_price:
+                    mm_qty = 3
+                    if room_to_buy(state, symbol, pending) > 0 and pos + pending < MM_CAP:
+                        qty = min(mm_qty, room_to_buy(state, symbol, pending), MM_CAP - pos - pending)
                         if qty > 0:
                             orders.append(Order(symbol, bid_price, qty))
                             pending += qty
-                if ask_price > bid and pos + pending > -cap and room_to_sell(state, symbol, pending) > 0:
-                    loser_buyer = symbol in LOSER_BUYERS
-                    if fair <= ask_price - 0.2 or loser_buyer or z > 0.5:
-                        qty = min(base_qty, room_to_sell(state, symbol, pending), cap + (pos + pending))
-                        if loser_buyer and sell_flow > buy_flow + 2:
-                            qty = min(qty + 1, room_to_sell(state, symbol, pending), cap + (pos + pending))
+                    if room_to_sell(state, symbol, pending) > 0 and pos + pending > -MM_CAP:
+                        qty = min(mm_qty, room_to_sell(state, symbol, pending), MM_CAP + pos + pending)
                         if qty > 0:
                             orders.append(Order(symbol, ask_price, -qty))
                             pending -= qty
 
-            # Trader-id layer: make the known losing traders interact with our quotes.
+            # Trader-id layer: exploit known losing counterparties.
             if symbol in LOSER_BUYERS and room_to_sell(state, symbol, pending) > 0:
                 qty = 2 if symbol in {"VEV_5300", "VEV_5400", "VEV_5500"} else 1
                 cap = 45 if symbol in {"VEV_5300", "VEV_5400", "VEV_5500"} else 25
