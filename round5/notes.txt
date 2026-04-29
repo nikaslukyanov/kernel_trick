@@ -8,6 +8,7 @@
     Oxygen Shake Garling leads Oxewgern shake Chocolate and Oxygen Shake evening breath)
 6. Panel
     It looks like 1x2 leads all but, mostly correlated with 1x4 and 2x2 visually. Verified with Correlation matrix. (i think this matrix is wrong, ik that sounds dumb but visiually it really looks like 1x2 leads all)
+8. Snackpack -- Figured out what we should do (cointegration/mean reversion strat on linear combo of chocolate, strawberry, and pistachio)
 
 No Tradable Trend Found yet
 
@@ -17,8 +18,7 @@ No Tradable Trend Found yet
 
 
 7. Robot -- Next Steps: Cointegration for the GBMs (VACUUMING, MOPPING, LAUNDRY) (IRONING and DISHES)
-8. Snackpack -- Figured out what we should do (cointegration/mean reversion strat on linear combo of chocolate, strawberry, and pistachio)
 9. Translator -- no idea
 10. UV -- no idea
 
-For all of these we also need to look at the spread and also the traderIDs to figure out how they're behaving.
+For all of these we also need to look at the spread to figure out how they're behaving.
