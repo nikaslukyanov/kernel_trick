@@ -18,7 +18,7 @@ No Tradable Trend Found yet
 
 7. Robot -- Next Steps: Cointegration for the GBMs (VACUUMING, MOPPING, LAUNDRY) (IRONING and DISHES)
 8. Snackpack -- Figured out what we should do (cointegration/mean reversion strat on linear combo of chocolate, strawberry, and pistachio)
-9. Translator
-10. UV
+9. Translator -- no idea
+10. UV -- no idea
 
 For all of these we also need to look at the spread and also the traderIDs to figure out how they're behaving.
