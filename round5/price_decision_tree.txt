@@ -1,0 +1,49 @@
+Claude's Decision tree for how to read the diagnostics of a given stochastic process.
+
+Start: difference or log-return series has median ≈ 0
+│
+├─ ADF on LEVELS
+│   ├─ Fails to reject (p > 0.05) → non-stationary → likely GBM/random walk family
+│   │   │
+│   │   ├─ ADF on log-returns
+│   │   │   ├─ Rejects (p < 0.05) → work in log-return space
+│   │   │   └─ Rejects on raw differences → work in difference space
+│   │   │
+│   │   └─ Ljung-Box on log-returns/differences
+│   │       ├─ Passes (p > 0.05) → WHITE NOISE
+│   │       │   └─ Hurst ≈ 0.5 → PURE GBM/RANDOM WALK
+│   │       │       → No autocorrelation edge
+│   │       │       → Only drift (if significant) or cross-asset structure
+│   │       │
+│   │       └─ Fails (p < 0.05) → AUTOCORRELATED NON-STATIONARY
+│   │           └─ Check ACF/PACF of returns
+│   │               ├─ Hurst > 0.5, positive lag-1 → MOMENTUM/fBM
+│   │               │   → Fit AR(1) on returns, follow the trend
+│   │               └─ Hurst < 0.5, negative lag-1 → unusual, investigate further
+│   │
+│   └─ Rejects (p < 0.05) → stationary → mean-reverting family
+│       │
+│       ├─ KPSS on levels
+│       │   ├─ Rejects (p < 0.05) → stationary around level → OU/AR family
+│       │   └─ Fails to reject → trend stationary → detrend first
+│       │
+│       ├─ Ljung-Box on levels (not differences)
+│       │   ├─ Fails (p < 0.05) → autocorrelated
+│       │   │   └─ ACF/PACF
+│       │   │       ├─ PACF cuts off at lag 1 → AR(1) / single OU
+│       │   │       ├─ PACF cuts off at lag 2 → AR(2) / two-factor OU
+│       │   │       ├─ ACF cuts off at lag 1 → MA(1)
+│       │   │       └─ Both decay slowly → ARMA(p,q), try AIC/BIC selection
+│       │   │
+│       │   └─ Passes → stationary white noise → just mean reversion to mu
+│       │
+│       └─ Hurst
+│           ├─ H < 0.5 → confirms mean reversion
+│           └─ H > 0.5 → contradicts ADF, check for structural breaks
+│
+└─ Residual diagnostics after fitting chosen model
+    ├─ Ljung-Box on residuals passes → model is correctly specified ✓
+    ├─ Ljung-Box on residuals fails → increase AR/MA order
+    ├─ Jarque-Bera passes → Gaussian residuals ✓
+    ├─ Jarque-Bera fails → fat tails, consider t-distributed errors
+    └─ ARCH-LM fails → volatility clustering, consider GARCH
