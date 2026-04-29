@@ -1,0 +1,24 @@
+1. Pebbles (basket reversion, sum of products stays constant)
+2. Sleep - Lead Lag relationship, prices follow same trends / factor model. Positive upward general trend. Strong correlation between components
+    Nylong lags cotton, polyester, suede
+    polyester leads nylon and lags suede
+    suede leads cotton, nylon and polyester
+5. Oxygen
+    Morning Breath leads Evening Breath, and Oxygen Shake Mint[lol])
+    Oxygen Shake Garling leads Oxewgern shake Chocolate and Oxygen Shake evening breath)
+6. Panel
+    It looks like 1x2 leads all but, mostly correlated with 1x4 and 2x2 visually. Verified with Correlation matrix. (i think this matrix is wrong, ik that sounds dumb but visiually it really looks like 1x2 leads all)
+
+No Tradable Trend Found yet
+
+3. Microchips - All GBMs, none are significant except OVAL with small drift. The SQUARE being up-trending in the historical data might be a red herring
+
+4. Galaxy - On average upward trending. All trades are clustered (either all 5 trade in a timestamp, or none trade. DK how this is useful yet)
+
+
+7. Robot -- Next Steps: Cointegration for the GBMs (VACUUMING, MOPPING, LAUNDRY) (IRONING and DISHES)
+8. Snackpack
+9. Translator
+10. UV
+
+For all of these we also need to look at the spread and also the traderIDs to figure out how they're behaving.
