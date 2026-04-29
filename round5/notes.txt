@@ -7,7 +7,8 @@
     Morning Breath leads Evening Breath, and Oxygen Shake Mint[lol])
     Oxygen Shake Garling leads Oxewgern shake Chocolate and Oxygen Shake evening breath)
 6. Panel
-    It looks like 1x2 leads all but, mostly correlated with 1x4 and 2x2 visually. Verified with Correlation matrix. (i think this matrix is wrong, ik that sounds dumb but visiually it really looks like 1x2 leads all)
+    It looks like 1x2 leads all but, mostly correlated with 1x4 and 2x2 visually. Verified with Correlation matrix. 
+    (i think this matrix is wrong, ik that sounds dumb but visiually it really looks like 1x2 leads all)
 
 No Tradable Trend Found yet
 

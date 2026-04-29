@@ -1,0 +1,43 @@
+You have the unique opportunity to trade on the Ignith market for this final round only. This neighboring planet is known for its volcanic scenery and heated market dynamics. You'll have a set budget of 1,000,000 XIRECs and access to their primary new source, “Ashflow Alpha” to make informed decisions.
+
+Be aware that there are trading fees involved, tied to the volume per product you choose to trade. Analyze the Ashflow Alpha articles to spot opportunities and develop your strategy for this final manual challenge. This is a one-time opportunity and does not affect your algorithmic trading activities. Enter your submission below and click Submit to confirm.
+
+# **Manual trading challenge: “Extra! Extra! Read all about it!”**
+
+You get access to a new source that you can use to build a portfolio that you hold until the next day. Use the news to inform how you structure your portfolio and which instruments you want to buy or sell.
+
+You’ve been invited to trade on the Ignith exchange for one day only. An exclusive event and perfect opportunity to make some big final profits before the trading champion of the galaxy is crowned. You have been granted access to Ignith’s most trusted news source: Ashflow Alpha. You’ll find all the information you need right there. Be aware that trading these foreign goods comes at a price. The more you trade in one good, the more expensive it will get. This is the final stretch. Make it count!
+
+Fee formula is as follows:
+
+***fee = (volume_for_specific_product / 100) * (volume_for_specific_product / 100) ** budget**
+
+Budget is **1,000,000**.
+
+You are allowed to distribute less than the whole 100% of the budget.
+
+You are not allowed to distribute more than 100% of the budget.
+
+Used budget will be subtracted from your trade PnL. Unused budget will not be added to your profit, but will simply expire worthless.
+
+This is how the grading works: 
+
+- We define a return range and anchor for every product (like 1 day returns let's say)
+- How people submit their answers will move the actual returns within the range, so if everybody thinks something is a strong buy, price will go up more than our anchor (within the range)
+- It's up to you to critically read text and see that some news are good / bad / already priced in, etc.
+
+### A small change was updated to the Ashflow Alpha visual at 12:00 CEST on Wednesday, 29/04 as communicated in Discord.
+
+The updated text is below and will be available in the downloadable image shortly:
+
+Index Committee Confirms Sulfur Ltd. for Elemental Index 118
+
+Elemental Index 118 will add Sulfur Reactor in its upcoming rebalance, according to the index committee's latest notice. The inclusion follows a review of eligible constituents across the elemental processing sector, where Sulfur Reactor's products are regarded as industry benchmarks.
+
+Funds tracking the index are expected to adjust their holdings accordingly once the rebalance takes effect later this cycle.
+
+Forever Feathers Ltd. is the same as Eternal Feathers Ltd. This is a typo on our end, apologies! This typo has no impact.
+
+## **Submit your orders**
+
+Choose the goods you would like to trade, input your order details directly in the Manual Challenge Overview window and click the “Submit” button. You can re-submit your orders until the end of the trading round. When the round ends, the last submitted orders will be locked in and processed.

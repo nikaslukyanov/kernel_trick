@@ -1,0 +1,8 @@
+
+The returns or price changes will be affected by the IMC mods' predetermined range + what people submitted. If the range is [x,y],
+and people mostly buy, the final result will be closer to y. 
+
+
+pnl = returns - budget used 
+
+Can only submit integers for percentages (ie my investment has to be a multiple of 10,000)
