@@ -8,6 +8,23 @@ both vals are garbage tho
     Nylong lags cotton, polyester, suede
     polyester leads nylon and lags suede
     suede leads cotton, nylon and polyester
+
+To Implement
+
+1. Pebbles
+    Structural: L+M+S+XL+XS = 50,000 (std=2.8, ADF p≈0, perfectly stationary basket constraint)
+    XL is the balancing product: XL return corr = -0.96 vs basket average (L+M+S+XS mean)
+    Granger chain: XS→S (10t), S→M (30t), M→L (10t), L/S→XL (30t)
+    Note: spread=16.6 kills high-frequency Granger strategies.
+    Structure: XL+XS pair and S+L pair are mirrors of each other around 10k.
+               M is a perfect mirror of the basket (XL+S+L+XS) around 10k (M mean=10263, 66.8% of time >= 10k).
+    Strategy: Pair MM — XL+XS avg vs 10k drives BOTH pairs simultaneously (mirror enforced).
+      - XL+XS avg >= 10k → SHORT XL+XS, LONG S+L (they move opposite)
+      - XL+XS avg <  10k → LONG XL+XS, SHORT S+L
+      - M (solo): SHORT when M >= 10k, LONG when M < 10k
+      Execution: passive MM at bid (buys) / ask (sells), 4 units per quote (40% of LIMIT=10).
+      Fills captured when market trades cross our quotes (50% at bid, 50% at ask observed).
+    Backtest (LIMIT=10, passive MM): Day 2 +57K, Day 3 +30K, Day 4 -9K → Total +78K (2/3 win).
 5. Oxygen
     Morning Breath leads Evening Breath, and Oxygen Shake Mint[lol])
     Oxygen Shake Garling leads Oxewgern shake Chocolate and Oxygen Shake evening breath)
