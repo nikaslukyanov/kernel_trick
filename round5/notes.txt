@@ -13,7 +13,6 @@
       Fills captured when market trades cross our quotes (50% at bid, 50% at ask observed).
     Backtest (LIMIT=10, passive MM): Day 2 +57K, Day 3 +30K, Day 4 -9K → Total +78K (2/3 win).
 
-
 7. Robots: robot_trader.py
 Vacuuming, Mopping, Laundry = GBM
 Dishes = GBM except shock on day 4
@@ -22,7 +21,8 @@ Ironing = GBM except shock on day 2
 Market making does not super well on the GBM
 Currently at 186k on backtest: mostly from dishes shocks
 
-2. Sleep: sleep.py - Lead Lag relationship, prices follow same trends / factor model. Positive upward general trend. Strong correlation between components
+2. Sleep: sleep.py - Lead Lag relationship, prices follow same trends / factor model. 
+Positive upward general trend. Strong correlation between components
     Nylong lags cotton, polyester, suede
     polyester leads nylon and lags suede
     suede leads cotton, nylon and polyester
@@ -31,17 +31,13 @@ Currently at 186k on backtest: mostly from dishes shocks
 ----
 TODO 
 
-
-
-
 5. Oxygen
     Morning Breath leads Evening Breath, and Oxygen Shake Mint[lol])
     Oxygen Shake Garling leads Oxewgern shake Chocolate and Oxygen Shake evening breath)
+
 6. Panel
     It looks like 1x2 leads all but, mostly correlated with 1x4 and 2x2 visually. Verified with Correlation matrix. 
     (i think this matrix is wrong, ik that sounds dumb but visiually it really looks like 1x2 leads all)
-
-No Tradable Trend Found yet
 
 3. Microchips - 
 All GBMs, none are significant except OVAL with small drift. 
@@ -53,7 +49,9 @@ The SQUARE being up-trending in the historical data might be a red herring
 8. Snackpack
     Cointegration via three products. Found fair price. Sell above z score and buy above z score.
     Mean reversion strat on linear combo of chocolate, strawberry, and pistachio
+
 9. Translator -- no idea
+
 10. UV -- no idea
 
 For all of these we also need to look at the spread to figure out how they're behaving.
