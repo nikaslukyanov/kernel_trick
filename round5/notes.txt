@@ -28,16 +28,15 @@ The SQUARE being up-trending in the historical data might be a red herring
 7. Robots
 Vacuuming, Mopping, Laundry = GBM
 Dishes = GBM except shock on day 4
-Ironing = GBM except shock on day 2 
+Ironing = GBM except shock on day 2
 
-Market making does not super well on the GBM 
-Currently at 186k on backtest: mostly from dishes shocks 
+Market making does not super well on the GBM
+Currently at 186k on backtest: mostly from dishes shocks
 
-8. Snackpack 
-    Cointegration via three products . Found fair price. Sell above z score and buy above z score.  
+8. Snackpack
+    Cointegration via three products. Found fair price. Sell above z score and buy above z score.
     Mean reversion strat on linear combo of chocolate, strawberry, and pistachio
-
 9. Translator -- no idea
 10. UV -- no idea
 
-For all of these we also need to look at the spread and also the traderIDs to figure out how they're behaving.
+For all of these we also need to look at the spread to figure out how they're behaving.
