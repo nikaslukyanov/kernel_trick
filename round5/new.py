@@ -167,13 +167,20 @@ VERY_CAUTIOUS_PRODUCTS = {
     "MICROCHIP_TRIANGLE",
 }
 ULTRA_CAUTIOUS_PRODUCTS = {"PEBBLES_M", "UV_VISOR_MAGENTA"}
-NO_TRADE_PRODUCTS = {"PANEL_1X2", "GALAXY_SOUNDS_SOLAR_FLAMES", "UV_VISOR_MAGENTA"}
-
-# Shock-reversal logic from robot_trader.py for DISHES + IRONING.
-SHOCK_REVERSAL_PRODUCTS = {"ROBOT_DISHES", "ROBOT_IRONING"}
-SHOCK_THRESH = 0.005
-MAX_HOLD_TICKS = 20
-ENTRY_SIZE = 10
+NO_TRADE_PRODUCTS = {
+    "PANEL_1X2",
+    "GALAXY_SOUNDS_SOLAR_FLAMES",
+    "UV_VISOR_MAGENTA",
+    "PEBBLES_L",
+    "OXYGEN_SHAKE_MINT",
+    "SLEEP_POD_LAMB_WOOL",
+    "PANEL_2X2",
+    "SNACKPACK_VANILLA",
+}
+ROBOT_SHOCK_PRODUCTS = {"ROBOT_DISHES", "ROBOT_IRONING"}
+ROBOT_SHOCK_THRESHOLD = 0.005
+ROBOT_SHOCK_MAX_HOLD = 20
+ROBOT_SHOCK_ENTRY_SIZE = 10
 
 # Offline scan of day 2-4 showed product-level medium-horizon behavior that the
 # pair/basket strategy was leaving on the table.  direction=+1 follows a move,
@@ -403,7 +410,7 @@ class Trader:
             "flow": {},
             "product_flow": {},
             "ema": {},
-            "shock": {},
+            "robot_shock": {},
             "last_ts": None,
             "tick": 0,
         }
@@ -610,8 +617,6 @@ class Trader:
                 continue
             signals[symbol] += DRIFT_BIAS.get(symbol, 0.0)
             signals[symbol] += 0.35 * top_obi(book.depth)
-            inventory_penalty = 0.18 if symbol in DRIFT_PRODUCTS else 0.45
-            signals[symbol] -= inventory_penalty * book.position
 
     def build_signals(self, books: dict[str, ProductBook], memory: dict[str, Any]) -> dict[str, float]:
         mids = {symbol: book.mid for symbol, book in books.items() if book.mid is not None}
@@ -705,59 +710,54 @@ class Trader:
             sell_size = base_size + (1 if signal < -1.0 else 0)
             book.sell(int(ask_quote), sell_size)
 
-    def trade_shock_reversal(self, book: ProductBook, memory: dict[str, Any]) -> None:
+    def trade_robot_shock(self, book: ProductBook, memory: dict[str, Any]) -> None:
         if book.mid is None or book.best_bid is None or book.best_ask is None:
             return
-        sym = book.symbol
-        shock_mem = memory.setdefault("shock", {})
-        sm = shock_mem.setdefault(sym, {"last_mid": book.mid, "anchor": None, "hold_ticks": 0, "entry_dir": 0})
-        last_mid = float(sm.get("last_mid", book.mid))
+        shock_mem = memory.setdefault("robot_shock", {})
+        item = shock_mem.setdefault(book.symbol, {"last_mid": book.mid, "anchor": None, "hold": 0})
+        last_mid = float(item.get("last_mid", book.mid))
         log_ret = math.log(book.mid / last_mid) if last_mid > 0 else 0.0
+        shock = abs(log_ret) > ROBOT_SHOCK_THRESHOLD
         pos = book.position
-        bid_size = abs(book.depth.buy_orders.get(book.best_bid, 0))
-        ask_size = abs(book.depth.sell_orders.get(book.best_ask, 0))
-        shock = abs(log_ret) > SHOCK_THRESH
 
         if pos != 0 and not shock:
-            anchor = sm.get("anchor")
-            hold = int(sm.get("hold_ticks", 0)) + 1
-            sm["hold_ticks"] = hold
-            if anchor is None:
+            hold = int(item.get("hold", 0)) + 1
+            item["hold"] = hold
+            anchor = item.get("anchor")
+            if not isinstance(anchor, (int, float)):
                 if pos > 0:
-                    book.sell(book.best_bid, pos)
+                    book.sell(book.best_bid, abs(pos))
                 else:
-                    book.buy(book.best_ask, -pos)
-            elif hold >= MAX_HOLD_TICKS:
+                    book.buy(book.best_ask, abs(pos))
+            elif hold >= ROBOT_SHOCK_MAX_HOLD:
                 if pos > 0:
-                    book.sell(book.best_bid, min(pos, bid_size))
+                    book.sell(book.best_bid, abs(pos))
                 else:
-                    book.buy(book.best_ask, min(-pos, ask_size))
+                    book.buy(book.best_ask, abs(pos))
             else:
                 if pos > 0:
-                    target = max(int(round(float(anchor))), book.best_bid + 1)
-                    book.sell(target, pos)
+                    book.sell(max(int(round(anchor)), book.best_bid + 1), abs(pos))
                 else:
-                    target = min(int(round(float(anchor))), book.best_ask - 1)
-                    book.buy(target, -pos)
+                    book.buy(min(int(round(anchor)), book.best_ask - 1), abs(pos))
 
         if shock:
-            sm["anchor"] = round(last_mid, 4)
-            sm["hold_ticks"] = 0
-            sm["entry_dir"] = -1 if log_ret > 0 else 1
+            item["anchor"] = last_mid
+            item["hold"] = 0
             if log_ret > 0:
-                qty = min(pos + ENTRY_SIZE, bid_size)
-                if qty > 0:
-                    book.sell(book.best_bid, qty)
+                target_pos = -ROBOT_SHOCK_ENTRY_SIZE
+                delta = target_pos - book.position
+                if delta < 0:
+                    book.sell(book.best_bid, -delta)
             else:
-                qty = min(ENTRY_SIZE - pos, ask_size)
-                if qty > 0:
-                    book.buy(book.best_ask, qty)
+                target_pos = ROBOT_SHOCK_ENTRY_SIZE
+                delta = target_pos - book.position
+                if delta > 0:
+                    book.buy(book.best_ask, delta)
 
-        if pos == 0 and not shock:
-            sm["anchor"] = None
-            sm["hold_ticks"] = 0
-            sm["entry_dir"] = 0
-        sm["last_mid"] = round(book.mid, 4)
+        if book.position == 0 and not shock:
+            item["anchor"] = None
+            item["hold"] = 0
+        item["last_mid"] = round(book.mid, 4)
 
     def run(self, state: TradingState):
         memory = self.load_memory(state.traderData)
@@ -778,8 +778,8 @@ class Trader:
             if symbol in NO_TRADE_PRODUCTS:
                 orders[symbol] = []
                 continue
-            if symbol in SHOCK_REVERSAL_PRODUCTS:
-                self.trade_shock_reversal(book, memory)
+            if symbol in ROBOT_SHOCK_PRODUCTS:
+                self.trade_robot_shock(book, memory)
                 orders[symbol] = book.orders
                 continue
             self.trade_product(book, signals.get(symbol, 0.0))
