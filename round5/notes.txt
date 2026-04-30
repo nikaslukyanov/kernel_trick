@@ -1,4 +1,9 @@
 1. Pebbles (basket reversion, sum of products stays constant)
+
+cant make algo work for some reason 
+trading the z score of them individually (30k) does better than basket stuff (10k)
+both vals are garbage tho 
+
 2. Sleep - Lead Lag relationship, prices follow same trends / factor model. Positive upward general trend. Strong correlation between components
     Nylong lags cotton, polyester, suede
     polyester leads nylon and lags suede
@@ -12,13 +17,26 @@
 
 No Tradable Trend Found yet
 
-3. Microchips - All GBMs, none are significant except OVAL with small drift. The SQUARE being up-trending in the historical data might be a red herring
+3. Microchips - 
+All GBMs, none are significant except OVAL with small drift. 
+The SQUARE being up-trending in the historical data might be a red herring
+
 
 4. Galaxy - On average upward trending. All trades are clustered (either all 5 trade in a timestamp, or none trade. DK how this is useful yet)
 
 
-7. Robot -- Next Steps: Cointegration for the GBMs (VACUUMING, MOPPING, LAUNDRY) (IRONING and DISHES)
-8. Snackpack -- Figured out what we should do (cointegration/mean reversion strat on linear combo of chocolate, strawberry, and pistachio)
+7. Robots
+Vacuuming, Mopping, Laundry = GBM
+Dishes = GBM except shock on day 4
+Ironing = GBM except shock on day 2 
+
+Market making does not super well on the GBM 
+Currently at 186k on backtest: mostly from dishes shocks 
+
+8. Snackpack 
+    Cointegration via three products . Found fair price. Sell above z score and buy above z score.  
+    Mean reversion strat on linear combo of chocolate, strawberry, and pistachio
+
 9. Translator -- no idea
 10. UV -- no idea
 
