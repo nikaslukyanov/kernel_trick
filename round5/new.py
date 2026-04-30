@@ -169,6 +169,12 @@ VERY_CAUTIOUS_PRODUCTS = {
 ULTRA_CAUTIOUS_PRODUCTS = {"PEBBLES_M", "UV_VISOR_MAGENTA"}
 NO_TRADE_PRODUCTS = {"PANEL_1X2", "GALAXY_SOUNDS_SOLAR_FLAMES", "UV_VISOR_MAGENTA"}
 
+# Shock-reversal logic from robot_trader.py for DISHES + IRONING.
+SHOCK_REVERSAL_PRODUCTS = {"ROBOT_DISHES", "ROBOT_IRONING"}
+SHOCK_THRESH = 0.005
+MAX_HOLD_TICKS = 20
+ENTRY_SIZE = 10
+
 # Offline scan of day 2-4 showed product-level medium-horizon behavior that the
 # pair/basket strategy was leaving on the table.  direction=+1 follows a move,
 # direction=-1 fades it.  lookback controls the online EMA horizon, and strength
@@ -397,6 +403,7 @@ class Trader:
             "flow": {},
             "product_flow": {},
             "ema": {},
+            "shock": {},
             "last_ts": None,
             "tick": 0,
         }
@@ -698,6 +705,60 @@ class Trader:
             sell_size = base_size + (1 if signal < -1.0 else 0)
             book.sell(int(ask_quote), sell_size)
 
+    def trade_shock_reversal(self, book: ProductBook, memory: dict[str, Any]) -> None:
+        if book.mid is None or book.best_bid is None or book.best_ask is None:
+            return
+        sym = book.symbol
+        shock_mem = memory.setdefault("shock", {})
+        sm = shock_mem.setdefault(sym, {"last_mid": book.mid, "anchor": None, "hold_ticks": 0, "entry_dir": 0})
+        last_mid = float(sm.get("last_mid", book.mid))
+        log_ret = math.log(book.mid / last_mid) if last_mid > 0 else 0.0
+        pos = book.position
+        bid_size = abs(book.depth.buy_orders.get(book.best_bid, 0))
+        ask_size = abs(book.depth.sell_orders.get(book.best_ask, 0))
+        shock = abs(log_ret) > SHOCK_THRESH
+
+        if pos != 0 and not shock:
+            anchor = sm.get("anchor")
+            hold = int(sm.get("hold_ticks", 0)) + 1
+            sm["hold_ticks"] = hold
+            if anchor is None:
+                if pos > 0:
+                    book.sell(book.best_bid, pos)
+                else:
+                    book.buy(book.best_ask, -pos)
+            elif hold >= MAX_HOLD_TICKS:
+                if pos > 0:
+                    book.sell(book.best_bid, min(pos, bid_size))
+                else:
+                    book.buy(book.best_ask, min(-pos, ask_size))
+            else:
+                if pos > 0:
+                    target = max(int(round(float(anchor))), book.best_bid + 1)
+                    book.sell(target, pos)
+                else:
+                    target = min(int(round(float(anchor))), book.best_ask - 1)
+                    book.buy(target, -pos)
+
+        if shock:
+            sm["anchor"] = round(last_mid, 4)
+            sm["hold_ticks"] = 0
+            sm["entry_dir"] = -1 if log_ret > 0 else 1
+            if log_ret > 0:
+                qty = min(pos + ENTRY_SIZE, bid_size)
+                if qty > 0:
+                    book.sell(book.best_bid, qty)
+            else:
+                qty = min(ENTRY_SIZE - pos, ask_size)
+                if qty > 0:
+                    book.buy(book.best_ask, qty)
+
+        if pos == 0 and not shock:
+            sm["anchor"] = None
+            sm["hold_ticks"] = 0
+            sm["entry_dir"] = 0
+        sm["last_mid"] = round(book.mid, 4)
+
     def run(self, state: TradingState):
         memory = self.load_memory(state.traderData)
         memory["tick"] = int(memory.get("tick", 0)) + 1
@@ -716,6 +777,10 @@ class Trader:
                 continue
             if symbol in NO_TRADE_PRODUCTS:
                 orders[symbol] = []
+                continue
+            if symbol in SHOCK_REVERSAL_PRODUCTS:
+                self.trade_shock_reversal(book, memory)
+                orders[symbol] = book.orders
                 continue
             self.trade_product(book, signals.get(symbol, 0.0))
             orders[symbol] = book.orders
