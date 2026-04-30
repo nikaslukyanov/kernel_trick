@@ -1,17 +1,4 @@
-1. Pebbles (basket reversion, sum of products stays constant)
-
-cant make algo work for some reason 
-trading the z score of them individually (30k) does better than basket stuff (10k)
-both vals are garbage tho 
-
-2. Sleep - Lead Lag relationship, prices follow same trends / factor model. Positive upward general trend. Strong correlation between components
-    Nylong lags cotton, polyester, suede
-    polyester leads nylon and lags suede
-    suede leads cotton, nylon and polyester
-
-To Implement
-
-1. Pebbles
+1. Pebbles: pebbles.ipynb
     Structural: L+M+S+XL+XS = 50,000 (std=2.8, ADF p≈0, perfectly stationary basket constraint)
     XL is the balancing product: XL return corr = -0.96 vs basket average (L+M+S+XS mean)
     Granger chain: XS→S (10t), S→M (30t), M→L (10t), L/S→XL (30t)
@@ -25,6 +12,27 @@ To Implement
       Execution: passive MM at bid (buys) / ask (sells), 4 units per quote (40% of LIMIT=10).
       Fills captured when market trades cross our quotes (50% at bid, 50% at ask observed).
     Backtest (LIMIT=10, passive MM): Day 2 +57K, Day 3 +30K, Day 4 -9K → Total +78K (2/3 win).
+
+
+7. Robots: robot_trader.py
+Vacuuming, Mopping, Laundry = GBM
+Dishes = GBM except shock on day 4
+Ironing = GBM except shock on day 2
+
+Market making does not super well on the GBM
+Currently at 186k on backtest: mostly from dishes shocks
+
+
+----
+TODO 
+
+2. Sleep - Lead Lag relationship, prices follow same trends / factor model. Positive upward general trend. Strong correlation between components
+    Nylong lags cotton, polyester, suede
+    polyester leads nylon and lags suede
+    suede leads cotton, nylon and polyester
+
+
+
 5. Oxygen
     Morning Breath leads Evening Breath, and Oxygen Shake Mint[lol])
     Oxygen Shake Garling leads Oxewgern shake Chocolate and Oxygen Shake evening breath)
@@ -40,15 +48,6 @@ The SQUARE being up-trending in the historical data might be a red herring
 
 
 4. Galaxy - On average upward trending. All trades are clustered (either all 5 trade in a timestamp, or none trade. DK how this is useful yet)
-
-
-7. Robots
-Vacuuming, Mopping, Laundry = GBM
-Dishes = GBM except shock on day 4
-Ironing = GBM except shock on day 2
-
-Market making does not super well on the GBM
-Currently at 186k on backtest: mostly from dishes shocks
 
 8. Snackpack
     Cointegration via three products. Found fair price. Sell above z score and buy above z score.
