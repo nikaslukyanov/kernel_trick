@@ -22,14 +22,15 @@ Ironing = GBM except shock on day 2
 Market making does not super well on the GBM
 Currently at 186k on backtest: mostly from dishes shocks
 
+2. Sleep: sleep.py - Lead Lag relationship, prices follow same trends / factor model. Positive upward general trend. Strong correlation between components
+    Nylong lags cotton, polyester, suede
+    polyester leads nylon and lags suede
+    suede leads cotton, nylon and polyester
+
 
 ----
 TODO 
 
-2. Sleep - Lead Lag relationship, prices follow same trends / factor model. Positive upward general trend. Strong correlation between components
-    Nylong lags cotton, polyester, suede
-    polyester leads nylon and lags suede
-    suede leads cotton, nylon and polyester
 
 
 
